@@ -1,0 +1,220 @@
+@page "/"
+@using GPSSimulator.Services
+@inject GpsSimulatorService SimService
+@implements IDisposable
+
+<h2>GPS SDR Simulator</h2>
+<p class="text-muted">Generates GPS L1 C/A signals in real-time and transmits via HackRF One. Update lat/lon anytime while running.</p>
+
+<div class="row g-3">
+
+    <!-- RINEX file -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header fw-bold">RINEX Navigation File</div>
+            <div class="card-body">
+                <input class="form-control" @bind="settings.RinexNavFilePath"
+                       placeholder="C:\rinex\brdc0010.22n" disabled="@isRunning" />
+                <div class="form-text">RINEX 2.11 GPS navigation file (e.g. from NASA CDDIS)</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Start position -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header fw-bold">Start Position</div>
+            <div class="card-body row g-2">
+                <div class="col-12">
+                    <label class="form-label">Latitude (deg)</label>
+                    <input type="number" class="form-control" step="0.000001" min="-90" max="90"
+                           @bind="settings.Latitude" disabled="@isRunning" />
+                </div>
+                <div class="col-12">
+                    <label class="form-label">Longitude (deg)</label>
+                    <input type="number" class="form-control" step="0.000001" min="-180" max="180"
+                           @bind="settings.Longitude" disabled="@isRunning" />
+                </div>
+                <div class="col-12">
+                    <label class="form-label">Altitude (m)</label>
+                    <input type="number" class="form-control" step="1"
+                           @bind="settings.AltitudeMeters" disabled="@isRunning" />
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Live position update -->
+    <div class="col-md-6">
+        <div class="card h-100 @(isRunning ? "border-success" : "")">
+            <div class="card-header fw-bold d-flex align-items-center gap-2">
+                Live Position Update
+                @if (isRunning)
+                {
+                    <span class="badge bg-success">ACTIVE</span>
+                }
+            </div>
+            <div class="card-body row g-2">
+                <div class="col-12">
+                    <label class="form-label">Latitude (deg)</label>
+                    <input type="number" class="form-control" step="0.000001" min="-90" max="90"
+                           @bind="liveLat" />
+                </div>
+                <div class="col-12">
+                    <label class="form-label">Longitude (deg)</label>
+                    <input type="number" class="form-control" step="0.000001" min="-180" max="180"
+                           @bind="liveLon" />
+                </div>
+                <div class="col-12">
+                    <label class="form-label">Altitude (m)</label>
+                    <input type="number" class="form-control" step="1" @bind="liveAlt" />
+                </div>
+                <div class="col-12">
+                    <button class="btn btn-outline-success w-100" @onclick="PushLivePosition"
+                            disabled="@(!isRunning)">
+                        Push to SDR
+                    </button>
+                    <div class="form-text">Updates the transmitted GPS position immediately — no restart needed</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- HackRF settings -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header fw-bold">HackRF Settings</div>
+            <div class="card-body row g-2">
+                <div class="col-md-3">
+                    <label class="form-label">TX VGA Gain (dB, 0-47)</label>
+                    <input type="number" class="form-control" min="0" max="47"
+                           @bind="settings.TxGainDb" disabled="@isRunning" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Sample Rate (MHz)</label>
+                    <input type="number" class="form-control" step="0.1" min="0.1" max="20"
+                           @bind="settings.SampleRateMHz" disabled="@isRunning" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Duration (sec, 0 = unlimited)</label>
+                    <input type="number" class="form-control" min="0"
+                           @bind="settings.DurationSeconds" disabled="@isRunning" />
+                </div>
+                <div class="col-md-3 d-flex align-items-end">
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="ampCheck"
+                               @bind="settings.AmpEnabled" disabled="@isRunning" />
+                        <label class="form-check-label" for="ampCheck">External amp</label>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Control bar -->
+    <div class="col-12 d-flex gap-2 align-items-center">
+        @if (!isRunning)
+        {
+            <button class="btn btn-success" @onclick="StartSimulation">Start</button>
+        }
+        else
+        {
+            <button class="btn btn-danger" @onclick="StopSimulation">Stop</button>
+            <div class="spinner-border spinner-border-sm text-success" role="status"></div>
+            <span class="text-success fw-semibold">Transmitting GPS L1 C/A at 1575.42 MHz</span>
+        }
+        @if (!string.IsNullOrEmpty(errorMessage))
+        {
+            <span class="text-danger ms-2">@errorMessage</span>
+        }
+    </div>
+
+    <!-- Log -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span class="fw-bold">Log</span>
+                <button class="btn btn-sm btn-outline-secondary" @onclick="ClearLog">Clear</button>
+            </div>
+            <div class="card-body p-0">
+                <pre class="log-output m-0 p-2">@logText</pre>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<style>
+    .log-output {
+        background: #1e1e1e;
+        color: #d4d4d4;
+        font-size: 0.8rem;
+        max-height: 280px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+</style>
+
+@code {
+    private SimulatorSettings settings = new()
+    {
+        Latitude        = 37.7749,
+        Longitude       = -122.4194,
+        AltitudeMeters  = 100,
+        DurationSeconds = 0,
+        SampleRateMHz   = 2.6,
+        TxGainDb        = 20
+    };
+
+    private double liveLat = 37.7749;
+    private double liveLon = -122.4194;
+    private double liveAlt = 100;
+
+    private bool   isRunning;
+    private string errorMessage = string.Empty;
+    private string logText      = string.Empty;
+
+    protected override void OnInitialized()
+    {
+        SimService.LogMessage += OnLog;
+    }
+
+    private async Task StartSimulation()
+    {
+        errorMessage = string.Empty;
+        liveLat  = settings.Latitude;
+        liveLon  = settings.Longitude;
+        liveAlt  = settings.AltitudeMeters;
+        isRunning = true;
+        StateHasChanged();
+
+        _ = SimService.StartAsync(settings).ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                errorMessage = t.Exception?.InnerException?.Message ?? "Unknown error";
+            isRunning = false;
+            InvokeAsync(StateHasChanged);
+        });
+
+        await Task.CompletedTask;
+    }
+
+    private void StopSimulation() => SimService.Stop();
+
+    private void PushLivePosition()
+    {
+        SimService.UpdatePosition(liveLat, liveLon, liveAlt);
+        OnLog($"[UI] Position pushed: {liveLat:F6} deg, {liveLon:F6} deg, alt {liveAlt:F0} m");
+    }
+
+    private void ClearLog() => logText = string.Empty;
+
+    private void OnLog(string message)
+    {
+        logText += message + "\n";
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => SimService.LogMessage -= OnLog;
+}
