@@ -108,43 +108,66 @@ public class GpsSimulatorService
 
 		Log($"Trip driver: {points.Count} points, duration {total:hh\\:mm\\:ss}");
 
-		for (int i = 0; i < points.Count; i++)
+		if (points.Count == 0) { Log("Trip has no points."); return; }
+
+		// Drive the position at the same 10 Hz rate the signal engine samples it.
+		// Stepping only once per trip point leaves CurrentXyz frozen for most
+		// epochs, so the pseudorange rate (and therefore the Doppler the receiver
+		// sees) carries no user velocity, and the receiver reports 0 km/h even
+		// though the position keeps jumping forward.
+		const double TickSeconds = 0.1;
+
+		double endSeconds  = points[^1].OffsetSeconds;
+		int    seg         = 0;   // index of the trip point at or before "now"
+		int    lastReported = -1;
+
+		while (!ct.IsCancellationRequested)
 		{
-			if (ct.IsCancellationRequested) break;
+			double t = (DateTime.UtcNow - wallStart).TotalSeconds;
+			if (t > endSeconds) break;
 
-			var pt = points[i];
+			// Advance to the segment bracketing the current replay time
+			while (seg < points.Count - 2 && points[seg + 1].OffsetSeconds <= t)
+				seg++;
 
-			// How long since we started replaying?
-			var wallElapsed = DateTime.UtcNow - wallStart;
-			// How long should have elapsed by this point in the trip?
-			var targetElapsed = TimeSpan.FromSeconds(pt.OffsetSeconds);
-			// Wait if we're ahead of schedule
-			var delay = targetElapsed - wallElapsed;
-			if (delay > TimeSpan.Zero)
+			var a = points[seg];
+			var b = points[Math.Min(seg + 1, points.Count - 1)];
+
+			double span = b.OffsetSeconds - a.OffsetSeconds;
+			double f    = span > 1e-9 ? Math.Clamp((t - a.OffsetSeconds) / span, 0.0, 1.0) : 0.0;
+
+			double lat = a.Latitude       + (b.Latitude       - a.Latitude)       * f;
+			double lon = a.Longitude      + (b.Longitude      - a.Longitude)      * f;
+			double alt = a.AltitudeMeters + (b.AltitudeMeters - a.AltitudeMeters) * f;
+
+			UpdatePosition(lat, lon, alt);
+
+			if (seg != lastReported)
 			{
-				try { await Task.Delay(delay, ct); }
-				catch (OperationCanceledException) { break; }
+				lastReported = seg;
+				var targetElapsed = TimeSpan.FromSeconds(a.OffsetSeconds);
+
+				TripProgress?.Invoke(new TripProgressEvent(
+					PointIndex    : seg,
+					PointCount    : points.Count,
+					Latitude      : lat,
+					Longitude     : lon,
+					AltitudeMeters: alt,
+					SpeedKph      : a.SpeedKph,
+					HeadingDeg    : a.HeadingDeg,
+					Elapsed       : targetElapsed,
+					Total         : total,
+					SimulatedUtc  : simStartUtc + targetElapsed
+				));
+
+				// Log every 60 seconds of trip time
+				if (seg % 60 == 0)
+					Log($"[Trip {seg + 1}/{points.Count}] {lat:F6}, {lon:F6} | " +
+						$"{a.SpeedKph:F0} km/h | {targetElapsed:hh\\:mm\\:ss} elapsed");
 			}
 
-			UpdatePosition(pt.Latitude, pt.Longitude, pt.AltitudeMeters);
-
-			TripProgress?.Invoke(new TripProgressEvent(
-				PointIndex    : i,
-				PointCount    : points.Count,
-				Latitude      : pt.Latitude,
-				Longitude     : pt.Longitude,
-				AltitudeMeters: pt.AltitudeMeters,
-				SpeedKph      : pt.SpeedKph,
-				HeadingDeg    : pt.HeadingDeg,
-				Elapsed       : targetElapsed,
-				Total         : total,
-				SimulatedUtc  : simStartUtc + targetElapsed
-			));
-
-			// Log every 60 seconds of trip time
-			if (i % 60 == 0)
-				Log($"[Trip {i + 1}/{points.Count}] {pt.Latitude:F6}, {pt.Longitude:F6} | " +
-					$"{pt.SpeedKph:F0} km/h | {targetElapsed:hh\\:mm\\:ss} elapsed");
+			try { await Task.Delay(TimeSpan.FromSeconds(TickSeconds), ct); }
+			catch (OperationCanceledException) { break; }
 		}
 
 		Log("Trip replay finished.");
