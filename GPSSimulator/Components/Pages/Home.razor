@@ -1,4 +1,4 @@
-@page "/"
+﻿@page "/"
 @using GPSSimulator.Services
 @using GPSSimulator.GpsEngine
 @inject GpsSimulatorService SimService
@@ -77,10 +77,10 @@
                 <div class="form-check mt-2">
                     <input class="form-check-input" type="checkbox" id="useNowCheck"
                            @bind="settings.UseCurrentTime"
-                           disabled="@(isRunning || !rinexCoverage.CoversNow)" />
+                           disabled="@isRunning" />
                     <label class="form-check-label" for="useNowCheck">
                         Use current time as simulation start
-                        @if (settings.UseCurrentTime && !rinexCoverage.CoversNow)
+                        @if (settings.UseCurrentTime && rinexCoverage.IsValid && !rinexCoverage.CoversNow)
                         {
                             <span class="text-warning ms-1">(RINEX does not cover now)</span>
                         }
@@ -90,11 +90,11 @@
         </div>
     </div>
 
-    <!-- AxonTrip replay -->
+    <!-- Route replay -->
     <div class="col-12">
         <div class="card @(loadedTrip != null ? "border-primary" : "")">
             <div class="card-header fw-bold d-flex align-items-center gap-2">
-                AxonTrip Replay
+                Route Replay (Trip JSON / GPX)
                 @if (loadedTrip != null)
                 {
                     <span class="badge bg-primary">LOADED</span>
@@ -102,25 +102,75 @@
             </div>
             <div class="card-body">
                 <div class="row g-2 align-items-end">
-                    <div class="col-md-8">
-                        <label class="form-label">AxonTrip JSON File Path</label>
-                        <input class="form-control" @bind="axonTripFilePath"
-                               disabled="@isRunning"
-                               placeholder="C:\path\to\TripData-....json" />
+                    <div class="col-md-6">
+                        <label class="form-label">Route File Path (.json or .gpx)</label>
+                        <div class="input-group">
+                            <input class="form-control" @bind="routeFilePath"
+                                   disabled="@isRunning"
+                                   placeholder="C:\path\to\route.gpx or trip.json" />
+                            <button class="btn btn-outline-secondary text-nowrap"
+                                    type="button"
+                                    @onclick="BrowseForRoute"
+                                    disabled="@isRunning"
+                                    title="Browse for a trip JSON or GPX file">
+                                &#128193; Browse&hellip;
+                            </button>
+                        </div>
                     </div>
-                    <div class="col-md-2">
+                    <div class="col-md-3">
                         <button class="btn btn-outline-primary w-100"
-                                @onclick="LoadAxonTrip"
-                                disabled="@(isRunning || string.IsNullOrWhiteSpace(axonTripFilePath))">
+                                @onclick="LoadRoute"
+                                disabled="@(isRunning || string.IsNullOrWhiteSpace(routeFilePath))">
                             Load Trip
                         </button>
                     </div>
-                    <div class="col-md-2">
+                    <div class="col-md-3">
                         <button class="btn btn-outline-secondary w-100"
-                                @onclick="ClearAxonTrip"
+                                @onclick="ClearRoute"
                                 disabled="@(isRunning || loadedTrip == null)">
                             Clear
                         </button>
+                    </div>
+                </div>
+
+                <div class="row g-2 align-items-end mt-1">
+                    <div class="col-md-6">
+                        <label class="form-label">
+                            Playback Speed: <strong>@settings.PlaybackSpeed.ToString("F1")&times;</strong>
+                        </label>
+                        <input type="range" class="form-range"
+                               min="0.5" max="20" step="0.5"
+                               @bind="settings.PlaybackSpeed"
+                               @bind:event="oninput"
+                               disabled="@isRunning" />
+                        <div class="form-text">
+                            Scales the route timeline only &mdash; GPS time always runs at 1&times;.
+                            Useful for GPX routes without timestamps.
+                            @if (estimatedReplay != null)
+                            {
+                                <span>Replay takes <strong>@estimatedReplay</strong>.</span>
+                            }
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="btn-group btn-group-sm" role="group">
+                            @foreach (var preset in new[] { 1.0, 2.0, 5.0, 10.0 })
+                            {
+                                var p = preset;
+                                <button type="button"
+                                        class="btn @(Math.Abs(settings.PlaybackSpeed - p) < 0.01 ? "btn-primary" : "btn-outline-primary")"
+                                        @onclick="() => settings.PlaybackSpeed = p"
+                                        disabled="@isRunning">
+                                    @p.ToString("0")&times;
+                                </button>
+                            }
+                        </div>
+                        @if (settings.PlaybackSpeed > 10.0)
+                        {
+                            <div class="small text-warning mt-1">
+                                &#9888; High speeds may exceed receiver velocity limits (~500 m/s).
+                            </div>
+                        }
                     </div>
                 </div>
 
@@ -308,7 +358,7 @@
             <div class="spinner-border spinner-border-sm text-success" role="status"></div>
             @if (loadedTrip != null)
             {
-                <span class="text-primary fw-semibold">Replaying AxonTrip &#8594; HackRF 1575.42 MHz</span>
+                <span class="text-primary fw-semibold">Replaying route &#8594; HackRF 1575.42 MHz</span>
             }
             else
             {
@@ -425,9 +475,9 @@
     private double liveLon = -122.4194;
     private double liveAlt = 100;
 
-    // AxonTrip state
-    private string             axonTripFilePath = string.Empty;
-    private AxonTrip?          loadedTrip;
+    // Route state
+    private string             routeFilePath = string.Empty;
+    private Trip?              loadedTrip;
     private string             tripLoadError    = string.Empty;
     private TripProgressEvent? tripProgress;
 
@@ -452,9 +502,8 @@
         if (firstRender)
         {
             await JS.InvokeVoidAsync("mapInterop.initMap", "gps-map", settings.Latitude, settings.Longitude, 14);
-            // Pre-check coverage for the default RINEX path
-            if (!string.IsNullOrWhiteSpace(settings.RinexNavFilePath))
-                await RefreshRinexCoverage();
+            // Check coverage, and auto-download a fresher file if "now" isn't covered.
+            await EnsureCoverageAsync();
         }
     }
 
@@ -463,10 +512,42 @@
     private async Task RefreshRinexCoverage()
     {
         rinexCoverage = await Task.Run(() => SimService.CheckRinexCoverage(settings.RinexNavFilePath));
-        // If now is no longer covered, uncheck UseCurrentTime
-        if (!rinexCoverage.CoversNow)
-            settings.UseCurrentTime = false;
         StateHasChanged();
+    }
+
+    /// <summary>
+    /// Ensures the loaded RINEX file covers the current time. If it doesn't, the
+    /// freshest file is downloaded automatically before giving up.
+    ///
+    /// The current day's DAILY brdc file is built up incrementally on the server
+    /// and can lag real time by several hours, so simply re-reading it is not
+    /// enough. The downloader now prefers CDDIS HOURLY files, which are typically
+    /// only 15-60 min behind.
+    /// </summary>
+    private async Task EnsureCoverageAsync()
+    {
+        if (!string.IsNullOrWhiteSpace(settings.RinexNavFilePath))
+            await RefreshRinexCoverage();
+
+        if (rinexCoverage.IsValid && rinexCoverage.CoversNow)
+            return;
+
+        if (isDownloading) return;
+
+        downloadStatus = rinexCoverage.IsValid
+            ? "RINEX does not cover the current time - fetching the latest file…"
+            : "No usable RINEX file - fetching the latest…";
+        StateHasChanged();
+
+        await DownloadLatestRinex();
+
+        // If the freshest available file still doesn't reach "now", fall back to
+        // a fixed start time so the user can still transmit.
+        if (!rinexCoverage.CoversNow)
+        {
+            settings.UseCurrentTime = false;
+            StateHasChanged();
+        }
     }
 
     private async Task OnRinexPathChanged(ChangeEventArgs e)
@@ -518,16 +599,66 @@
         }
     }
 
-    // ── AxonTrip ─────────────────────────────────────────────────────────────
+    // ── Route ─────────────────────────────────────────────────────────────────
 
-    private async Task LoadAxonTrip()
+    /// <summary>
+    /// Wall-clock duration of the loaded route at the current playback speed.
+    /// </summary>
+    private string? estimatedReplay
+    {
+        get
+        {
+            if (loadedTrip == null || settings.PlaybackSpeed <= 0) return null;
+            var span = TimeSpan.FromSeconds(loadedTrip.TotalDuration.TotalSeconds / settings.PlaybackSpeed);
+            return span.TotalHours >= 1
+                ? $"{(int)span.TotalHours}h {span.Minutes}m"
+                : $"{span.Minutes}m {span.Seconds}s";
+        }
+    }
+
+    /// <summary>
+    /// Opens the native file picker and, on selection, loads the route immediately.
+    /// </summary>
+    private async Task BrowseForRoute()
+    {
+        try
+        {
+            // Neither JSON nor GPX has a reliable cross-platform UTType/MIME
+            // identifier, so declare the extensions explicitly for Windows.
+            var fileTypes = new FilePickerFileType(
+                new Dictionary<DevicePlatform, IEnumerable<string>>
+                {
+                    { DevicePlatform.WinUI, RouteLoader.SupportedExtensions },
+                });
+
+            var result = await FilePicker.Default.PickAsync(new PickOptions
+            {
+                PickerTitle = "Select a trip JSON or GPX route file",
+                FileTypes   = fileTypes,
+            });
+
+            if (result == null) return; // user cancelled
+
+            routeFilePath = result.FullPath;
+            StateHasChanged();
+
+            await LoadRoute();
+        }
+        catch (Exception ex)
+        {
+            tripLoadError = $"Could not open file picker: {ex.Message}";
+            StateHasChanged();
+        }
+    }
+
+    private async Task LoadRoute()
     {
         tripLoadError = string.Empty;
         loadedTrip    = null;
         try
         {
-            loadedTrip = await AxonTripParser.ParseFileAsync(axonTripFilePath);
-            OnLog($"[UI] AxonTrip loaded: {loadedTrip.Summary}");
+            loadedTrip = await RouteLoader.LoadAsync(routeFilePath);
+            OnLog($"[UI] Route loaded: {loadedTrip.Summary}");
             var routePoints = loadedTrip.Points.Select(p => new { lat = p.Latitude, lon = p.Longitude }).ToArray();
             await JS.InvokeVoidAsync("mapInterop.setRoute", (object)routePoints);
         }
@@ -538,7 +669,7 @@
         StateHasChanged();
     }
 
-    private async Task ClearAxonTrip()
+    private async Task ClearRoute()
     {
         loadedTrip    = null;
         tripProgress  = null;

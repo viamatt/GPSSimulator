@@ -31,15 +31,21 @@ public class GpsSimulatorService
 	private CancellationTokenSource? _cts;
 	private GpsSignalEngine? _engine;
 
+	// Signalled when a run has fully unwound (including the finally block that
+	// disposes the HackRF stream and device). Shutdown waits on this so the USB
+	// device is released before the process exits.
+	private TaskCompletionSource _runCompleted =
+		new(TaskCreationOptions.RunContinuationsAsynchronously);
+
 	// ── Trip replay ───────────────────────────────────────────────────────────
 
 	/// <summary>
-	/// Start the simulator with an AxonTrip replay.
+	/// Start the simulator with a route replay.
 	/// Timestamps in the trip are rebased so the trip begins at the RINEX
 	/// simulation start time.  Each position is pushed to the IQ engine at
 	/// the correct wall-clock interval so replay runs at 1× real speed.
 	/// </summary>
-	public async Task StartTripReplayAsync(SimulatorSettings settings, AxonTrip trip)
+	public async Task StartTripReplayAsync(SimulatorSettings settings, Trip trip)
 	{
 		if (IsRunning) throw new InvalidOperationException("Already running.");
 		ValidateSettings(settings);
@@ -47,6 +53,7 @@ public class GpsSimulatorService
 		Log($"Trip replay loaded: {trip.Summary}");
 
 		_cts    = new CancellationTokenSource();
+		_runCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 		IsRunning = true;
 		try
 		{
@@ -62,12 +69,38 @@ public class GpsSimulatorService
 			// Build engine with trip initial position
 			var g0 = await PrepareEngineAsync(settings, _cts.Token);
 
+			// Let the engine pull the trajectory on its own 0.1 s epoch clock.
+			// Positions sampled this way are always exactly one epoch apart, so the
+			// pseudorange rate (and hence Doppler) reflects true vehicle velocity
+			// with no contamination from wall-clock timer jitter.
+			//
+			// PlaybackSpeed scales only the TRIP timeline, never the GPS epoch clock:
+			// GPS time must continue to advance at exactly 1x or the navigation data
+			// would no longer agree with the transmitted signal. Speeding up playback
+			// therefore covers the route faster, which the receiver correctly sees as
+			// the vehicle travelling faster.
+			double playbackSpeed = Math.Clamp(settings.PlaybackSpeed, 0.1, 100.0);
+			if (playbackSpeed != 1.0)
+				Log($"Playback speed: {playbackSpeed:F2}x");
+
+			if (_engine != null)
+			{
+				_engine.PositionProvider = elapsed =>
+				{
+					trip.Interpolate(elapsed * playbackSpeed, out double lat, out double lon, out double alt);
+					double[] llh = { lat * Math.PI / 180.0, lon * Math.PI / 180.0, alt };
+					double[] xyz = new double[3];
+					Llh2Xyz(llh, xyz);
+					return xyz;
+				};
+			}
+
 					// Run IQ stream and trip position driver in parallel.
 					// Use a linked CTS so either task can abort the other on failure.
 					using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
 
 					var simStartUtc = GpsMath.GpsTimeToDateTimeUtc(g0);
-					var driverTask = RunTripDriverAsync(trip, simStartUtc, linkedCts.Token);
+					var driverTask = RunTripDriverAsync(trip, simStartUtc, playbackSpeed, linkedCts.Token);
 
 			#if WINDOWS
 					var streamTask = TransmitOnWindowsAsync(settings, g0, linkedCts.Token);
@@ -93,14 +126,17 @@ public class GpsSimulatorService
 							throw ex;
 					}
 		}
-		finally { IsRunning = false; _engine = null; }
+		finally { IsRunning = false; _engine = null; _runCompleted.TrySetResult(); }
 	}
 
 	/// <summary>
-	/// Drive position updates from the trip points at 1× real-time speed.
-	/// Rebases trip timestamps so they are relative to wall-clock start.
+	/// Reports trip progress to the UI at 1x real-time speed.
+	///
+	/// This drives the UI only. The actual transmitted position is pulled by the
+	/// signal engine through PositionProvider on its own epoch clock, so that the
+	/// Doppler seen by the receiver is not contaminated by this timer's jitter.
 	/// </summary>
-	private async Task RunTripDriverAsync(AxonTrip trip, DateTime simStartUtc, CancellationToken ct)
+	private async Task RunTripDriverAsync(Trip trip, DateTime simStartUtc, double playbackSpeed, CancellationToken ct)
 	{
 		var points    = trip.Points;
 		var wallStart = DateTime.UtcNow;
@@ -110,41 +146,22 @@ public class GpsSimulatorService
 
 		if (points.Count == 0) { Log("Trip has no points."); return; }
 
-		// Drive the position at the same 10 Hz rate the signal engine samples it.
-		// Stepping only once per trip point leaves CurrentXyz frozen for most
-		// epochs, so the pseudorange rate (and therefore the Doppler the receiver
-		// sees) carries no user velocity, and the receiver reports 0 km/h even
-		// though the position keeps jumping forward.
-		const double TickSeconds = 0.1;
-
-		double endSeconds  = points[^1].OffsetSeconds;
-		int    seg         = 0;   // index of the trip point at or before "now"
+		double endSeconds   = points[^1].OffsetSeconds;
 		int    lastReported = -1;
 
 		while (!ct.IsCancellationRequested)
 		{
-			double t = (DateTime.UtcNow - wallStart).TotalSeconds;
+			// Same scaling the engine's PositionProvider applies, so the UI stays
+			// in step with the transmitted position.
+			double t = (DateTime.UtcNow - wallStart).TotalSeconds * playbackSpeed;
 			if (t > endSeconds) break;
 
-			// Advance to the segment bracketing the current replay time
-			while (seg < points.Count - 2 && points[seg + 1].OffsetSeconds <= t)
-				seg++;
-
-			var a = points[seg];
-			var b = points[Math.Min(seg + 1, points.Count - 1)];
-
-			double span = b.OffsetSeconds - a.OffsetSeconds;
-			double f    = span > 1e-9 ? Math.Clamp((t - a.OffsetSeconds) / span, 0.0, 1.0) : 0.0;
-
-			double lat = a.Latitude       + (b.Latitude       - a.Latitude)       * f;
-			double lon = a.Longitude      + (b.Longitude      - a.Longitude)      * f;
-			double alt = a.AltitudeMeters + (b.AltitudeMeters - a.AltitudeMeters) * f;
-
-			UpdatePosition(lat, lon, alt);
+			int seg = trip.Interpolate(t, out double lat, out double lon, out double alt);
 
 			if (seg != lastReported)
 			{
 				lastReported = seg;
+				var a = points[seg];
 				var targetElapsed = TimeSpan.FromSeconds(a.OffsetSeconds);
 
 				TripProgress?.Invoke(new TripProgressEvent(
@@ -153,20 +170,22 @@ public class GpsSimulatorService
 					Latitude      : lat,
 					Longitude     : lon,
 					AltitudeMeters: alt,
-					SpeedKph      : a.SpeedKph,
+					SpeedKph      : a.SpeedKph * playbackSpeed,
 					HeadingDeg    : a.HeadingDeg,
 					Elapsed       : targetElapsed,
 					Total         : total,
-					SimulatedUtc  : simStartUtc + targetElapsed
+					// GPS time always advances at 1x regardless of playback speed,
+					// so report actual elapsed wall time rather than trip time.
+					SimulatedUtc  : simStartUtc + TimeSpan.FromSeconds(t / playbackSpeed)
 				));
 
 				// Log every 60 seconds of trip time
 				if (seg % 60 == 0)
 					Log($"[Trip {seg + 1}/{points.Count}] {lat:F6}, {lon:F6} | " +
-						$"{a.SpeedKph:F0} km/h | {targetElapsed:hh\\:mm\\:ss} elapsed");
+						$"{a.SpeedKph * playbackSpeed:F0} km/h | {targetElapsed:hh\\:mm\\:ss} elapsed");
 			}
 
-			try { await Task.Delay(TimeSpan.FromSeconds(TickSeconds), ct); }
+			try { await Task.Delay(TimeSpan.FromMilliseconds(200), ct); }
 			catch (OperationCanceledException) { break; }
 		}
 
@@ -193,12 +212,39 @@ public class GpsSimulatorService
 		ValidateSettings(settings);
 
 		_cts = new CancellationTokenSource();
+		_runCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 		IsRunning = true;
 		try { await RunAsync(settings, _cts.Token); }
-		finally { IsRunning = false; _engine = null; }
+		finally { IsRunning = false; _engine = null; _runCompleted.TrySetResult(); }
 	}
 
 	public void Stop() => _cts?.Cancel();
+
+	/// <summary>
+	/// Cancels any running transmission and waits for it to unwind so the HackRF
+	/// stream and device are disposed (which calls hackrf_stop_tx/hackrf_close).
+	///
+	/// This must be awaited before the process exits. Without it, libhackrf's
+	/// hackrf_exit() runs while the device is still streaming and blocks until the
+	/// USB device is physically disconnected, leaving the app apparently hung.
+	/// </summary>
+	/// <param name="timeout">
+	/// Maximum time to wait. Bounded so a wedged device can never prevent the
+	/// application from closing.
+	/// </param>
+	public async Task StopAndWaitAsync(TimeSpan? timeout = null)
+	{
+		if (!IsRunning) return;
+
+		Log("Shutting down: stopping transmission...");
+		_cts?.Cancel();
+
+		var limit = timeout ?? TimeSpan.FromSeconds(5);
+		var completed = await Task.WhenAny(_runCompleted.Task, Task.Delay(limit));
+
+		if (completed != _runCompleted.Task)
+			Log($"Transmission did not stop within {limit.TotalSeconds:F0} s; closing anyway.");
+	}
 
 	// ── Core pipeline ────────────────────────────────────────────────
 
@@ -467,7 +513,19 @@ public record SimulatorSettings
 	/// instead of the first epoch in the RINEX file.
 	/// The RINEX file must cover the current time for this to succeed.
 	/// </summary>
-	public bool   UseCurrentTime   { get; set; } = false;
+	public bool   UseCurrentTime   { get; set; } = true;
+
+	/// <summary>
+	/// Trip replay rate multiplier. 1.0 is real time; 2.0 covers the route twice
+	/// as fast. Useful for sparse GPX routes with no timestamps, where the
+	/// synthesised timings would otherwise make replay tediously long.
+	///
+	/// This scales only the trip timeline. GPS time still advances at 1x, so the
+	/// receiver simply observes a faster-moving vehicle. Very high values produce
+	/// unrealistic velocities that a receiver may reject (most refuse to track
+	/// beyond roughly 500 m/s, the COCOM limit).
+	/// </summary>
+	public double PlaybackSpeed    { get; set; } = 1.0;
 }
 
 /// <summary>

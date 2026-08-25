@@ -1,0 +1,70 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: GPSSimulator/GPSSimulator.csproj
+  TFM: net10.0-windows10.0.19041.0
+  CONFIGURATION: Release
+  RUNTIME: win-x64
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install MAUI Windows workload
+        run: dotnet workload install maui-windows --skip-sign-check
+
+      - name: Restore
+        run: dotnet restore ${{ env.PROJECT }} -p:TargetFrameworks=${{ env.TFM }} -r ${{ env.RUNTIME }}
+
+      - name: Publish
+        run: >
+          dotnet publish ${{ env.PROJECT }}
+          -c ${{ env.CONFIGURATION }}
+          -f ${{ env.TFM }}
+          -r ${{ env.RUNTIME }}
+          --self-contained true
+          -p:TargetFrameworks=${{ env.TFM }}
+          -p:WindowsPackageType=None
+          -p:WindowsAppSDKSelfContained=true
+          -o publish
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path publish/* -DestinationPath GPSSimulator-${{ env.RUNTIME }}.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPSSimulator-${{ env.RUNTIME }}
+          path: GPSSimulator-${{ env.RUNTIME }}.zip
+          retention-days: 30
+
+      - name: Publish release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          body: |
+            Automated build of `${{ github.sha }}`.
+
+            Download `GPSSimulator-${{ env.RUNTIME }}.zip`, extract it and run `GPSSimulator.exe`.
+            Windows 10 (1809) or later, 64-bit. No .NET runtime install is required.
+          files: GPSSimulator-${{ env.RUNTIME }}.zip

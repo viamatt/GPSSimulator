@@ -28,6 +28,20 @@ public sealed class GpsSignalEngine
 		set => Volatile.Write(ref _xyz, value);
 	}
 
+	/// <summary>
+	/// Optional trajectory source. When set, the engine calls this once per
+	/// 0.1 s epoch with the elapsed simulation time (seconds since streaming
+	/// started) and uses the returned ECEF position instead of <see cref="CurrentXyz"/>.
+	///
+	/// This exists because Doppler is derived from the change in position between
+	/// consecutive epochs. If position is pushed in from an external timer, that
+	/// timer's jitter is indistinguishable from real velocity and is injected
+	/// straight into the receiver's carrier tracking loop, and the error grows
+	/// with speed. Sampling the trajectory on the engine's own epoch clock makes
+	/// the interval exactly 0.1 s every time, so the Doppler is exact.
+	/// </summary>
+	public Func<double, double[]>? PositionProvider { get; set; }
+
 	// ── private state ────────────────────────────────────────────────
 
 	private double[] _xyz = new double[3];
@@ -70,6 +84,15 @@ public sealed class GpsSignalEngine
 	/// multi-sdr-gps-sim exactly (absolute path-loss gain, plain >>4 on packing).
 	/// </summary>
 	private const bool UseGainNormalization = true;
+
+	/// <summary>
+	/// Hysteresis applied to the elevation mask (degrees). A satellite must rise
+	/// above the mask to be acquired, but is only dropped once it falls this far
+	/// below it. Without hysteresis an SV sitting near the mask flips in and out
+	/// on successive reallocations, and every re-add costs the receiver a fresh
+	/// acquisition, which shows up as intermittent loss of fix.
+	/// </summary>
+	private const double ElevMaskHysteresisDeg = 2.5;
 
 	public GpsSignalEngine(
 		Ephemeris[][] eph,
@@ -132,6 +155,10 @@ public sealed class GpsSignalEngine
 		// generator slower than real time.
 		int[] chanGain = new int[MaxChan];
 
+		// Gain normalisation factor, locked in on the first epoch with active
+		// channels and then held constant. See the usage site for why.
+		double gainScale = -1.0;
+
 		// Measures pure generation cost per epoch (excludes the blocking write to
 		// the SDR). Must stay well below 100 ms/epoch or TX will underrun.
 		var genStopwatch = new System.Diagnostics.Stopwatch();
@@ -141,7 +168,12 @@ public sealed class GpsSignalEngine
 		while (!ct.IsCancellationRequested)
 		{
 			genStopwatch.Start();
-			double[] xyz = (double[])CurrentXyz.Clone(); // snapshot position
+			// Sample the trajectory on the engine's own epoch clock when available,
+			// so consecutive positions are always exactly 0.1 s apart.
+			double[] xyz = PositionProvider is { } provider
+				? provider(epochCount10Hz * 0.1)
+				: (double[])CurrentXyz.Clone();
+			CurrentXyz = xyz;
 			UpdateActiveChannelCodePhase(grx, xyz, ieph);
 
 			int nActiveGains = 0;
@@ -164,25 +196,39 @@ public sealed class GpsSignalEngine
 				}
 			}
 
-			// Optional per-epoch gain normalisation. Disabled by default: it varies
-			// the composite amplitude from epoch to epoch, which disturbs receiver
-			// AGC and carrier tracking. See UseGainNormalization.
-			if (UseGainNormalization)
+			// Gain normalisation. The scale factor is computed ONCE, from the first
+			// epoch that has active channels, and then held fixed for the whole run.
+			//
+			// It must NOT be recomputed per epoch: the scale depends on how many
+			// channels are active, so every time AllocateChannels adds or drops a
+			// satellite the factor would change and rescale *every* channel at once.
+			// The receiver sees a simultaneous step in C/N0 on all satellites, which
+			// is a classic way to lose lock. Holding the scale fixed means adding or
+			// dropping a satellite changes only that satellite's contribution.
+			if (UseGainNormalization && nActiveGains > 0)
 			{
-				double sumSq = 0.0;
-				for (int i = 0; i < MaxChan; i++)
+				if (gainScale <= 0.0)
 				{
-					double a = chanGain[i] * 250.0 / 128.0 / (1 << Sc08RightShift);
-					sumSq += a * a;
-				}
-				if (sumSq > 0.0)
-				{
-					// Per-component (I or Q) standard deviation: carrier phase splits
-					// each channel's power between I and Q, hence the factor of 2.
-					double sigma = Math.Sqrt(sumSq / 2.0);
-					double scale = Sc08TargetRms / Math.Max(sigma, 1e-9);
+					double sumSq = 0.0;
 					for (int i = 0; i < MaxChan; i++)
-						chanGain[i] = (int)(chanGain[i] * scale);
+					{
+						double a = chanGain[i] * 250.0 / 128.0 / (1 << Sc08RightShift);
+						sumSq += a * a;
+					}
+					if (sumSq > 0.0)
+					{
+						// Per-component (I or Q) standard deviation: carrier phase splits
+						// each channel's power between I and Q, hence the factor of 2.
+						double sigma = Math.Sqrt(sumSq / 2.0);
+						gainScale = Sc08TargetRms / Math.Max(sigma, 1e-9);
+						Log($"Gain normalisation locked: scale={gainScale:F4} from {nActiveGains} active channels");
+					}
+				}
+
+				if (gainScale > 0.0)
+				{
+					for (int i = 0; i < MaxChan; i++)
+						chanGain[i] = (int)(chanGain[i] * gainScale);
 				}
 			}
 
@@ -386,8 +432,13 @@ public sealed class GpsSignalEngine
 		double[][] tmat = MakeTmat();
 		Ltcmat(llh, tmat);
 
-		// Compute visibility for all SVs
+		// Compute visibility for all SVs.
+		// Two thresholds are used: _elevMask to acquire a new satellite, and a
+		// slightly lower dropMask to keep one already being tracked (hysteresis).
+		double dropMask = _elevMask - ElevMaskHysteresisDeg * Pi / 180.0;
+
 		var visibleSvs = new List<(int sv, RangeData rho, double elev)>();
+		var retainableBySv = new Dictionary<int, RangeData>(MaxSat);
 		for (int sv = 0; sv < MaxSat; sv++)
 		{
 			if (!_eph[ieph][sv].Valid) continue;
@@ -409,31 +460,32 @@ public sealed class GpsSignalEngine
 			double[] azel = new double[2];
 			Neu2Azel(azel, neu);
 
-			if (azel[1] > _elevMask)
+			if (azel[1] > dropMask)
 			{
 				var rho = BuildRange(_eph[ieph][sv], grx, xyz, llh, tmat);
-				visibleSvs.Add((sv, rho, azel[1]));
+				// Above the drop threshold: eligible to be RETAINED.
+				retainableBySv[sv] = rho;
+				// Above the full mask: also eligible to be newly ACQUIRED.
+				if (azel[1] > _elevMask)
+					visibleSvs.Add((sv, rho, azel[1]));
 			}
 		}
 
 		// Prefer highest-elevation satellites when adding new channels
 		visibleSvs.Sort((a, b) => b.elev.CompareTo(a.elev));
 
-		var visibleBySv = new Dictionary<int, RangeData>(visibleSvs.Count);
-		foreach (var v in visibleSvs)
-			visibleBySv[v.sv] = v.rho;
-
 		bool[] assigned = new bool[MaxSat];
 		int nAssigned = 0;
 
-		// 1) Keep existing channels if their SV is still visible (sticky allocation).
+		// 1) Keep existing channels if their SV is still above the DROP threshold
+		//    (sticky allocation with hysteresis).
 		for (int i = 0; i < MaxChan; i++)
 		{
 			int prn = _chan[i].Prn;
 			if (prn <= 0) continue;
 
 			int sv = prn - 1;
-			if (sv < 0 || sv >= MaxSat || !visibleBySv.TryGetValue(sv, out var rho)
+			if (sv < 0 || sv >= MaxSat || !retainableBySv.TryGetValue(sv, out var rho)
 				|| nAssigned >= _maxActiveChan)
 			{
 				// Satellite no longer visible, or channel budget exhausted: free channel.
@@ -475,6 +527,13 @@ public sealed class GpsSignalEngine
 			_chan[i].Rho0 = rho;
 			var rho1 = BuildRange(_eph[ieph][sv], IncGpsTime(grx, 0.1), xyz, llh, tmat);
 			ComputeCodePhase(_chan[i], rho1, 0.1);
+
+			// ComputeCodePhase leaves Rho0 = rho1 (the range at grx+0.1), but the
+			// next UpdateActiveChannelCodePhase also runs at grx+0.1, which would
+			// give rhorate = 0 and hence zero Doppler for one epoch on every newly
+			// acquired satellite. Rewind the reference to the range at grx so the
+			// first tracked epoch already carries the correct Doppler.
+			_chan[i].Rho0 = rho;
 
 			assigned[sv] = true;
 			nAssigned++;

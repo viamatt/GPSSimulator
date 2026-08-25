@@ -71,6 +71,7 @@
         <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
         <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="$(MauiVersion)" />
         <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.0" />
+        <PackageReference Include="FrozenNorth.Gpx" Version="1.0.1" />
     </ItemGroup>
 
     <!-- nethackrf source files are only compiled for Windows (hackrf.dll is Windows-only) -->

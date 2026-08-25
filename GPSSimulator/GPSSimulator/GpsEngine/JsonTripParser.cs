@@ -3,9 +3,9 @@ using System.Text.Json;
 namespace GPSSimulator.GpsEngine;
 
 /// <summary>
-/// Parses an AxonTrip JSON file and returns a normalised <see cref="AxonTrip"/>.
+/// Parses a JSON trip file and returns a normalised <see cref="Trip"/>.
 /// </summary>
-public static class AxonTripParser
+public static class JsonTripParser
 {
 	private static readonly JsonSerializerOptions _opts = new()
 	{
@@ -15,25 +15,25 @@ public static class AxonTripParser
 	};
 
 	/// <summary>
-	/// Parse the given file and return an <see cref="AxonTrip"/> with all
+	/// Parse the given file and return a <see cref="Trip"/> with all
 	/// positions sorted by time and <see cref="TripPoint.OffsetSeconds"/>
 	/// relative to the first point.
 	/// </summary>
 	/// <exception cref="InvalidDataException">Thrown when the file has no valid positions.</exception>
-	public static async Task<AxonTrip> ParseFileAsync(string filePath)
+	public static async Task<Trip> ParseFileAsync(string filePath)
 	{
 		if (!File.Exists(filePath))
-			throw new FileNotFoundException($"AxonTrip file not found: {filePath}");
+			throw new FileNotFoundException($"Trip file not found: {filePath}");
 
 		await using var stream = File.OpenRead(filePath);
-		var root = await JsonSerializer.DeserializeAsync<AxonTripRoot>(stream, _opts)
-				   ?? throw new InvalidDataException("Failed to deserialize AxonTrip JSON.");
+		var root = await JsonSerializer.DeserializeAsync<JsonTripRoot>(stream, _opts)
+				   ?? throw new InvalidDataException("Failed to deserialize trip JSON.");
 
 		if (root.Positions.Count == 0)
-			throw new InvalidDataException("AxonTrip JSON contains no positions.");
+			throw new InvalidDataException("Trip JSON contains no positions.");
 
 		// Parse and sort by time
-		var parsed = new List<(DateTime utc, AxonPositionRaw raw)>(root.Positions.Count);
+		var parsed = new List<(DateTime utc, JsonPositionRaw raw)>(root.Positions.Count);
 		foreach (var p in root.Positions)
 		{
 			if (DateTime.TryParse(p.OccurredAt,
@@ -47,7 +47,7 @@ public static class AxonTripParser
 		}
 
 		if (parsed.Count == 0)
-			throw new InvalidDataException("AxonTrip JSON: no positions with parseable timestamps.");
+			throw new InvalidDataException("Trip JSON: no positions with parseable timestamps.");
 
 		parsed.Sort((a, b) => a.utc.CompareTo(b.utc));
 
@@ -64,11 +64,12 @@ public static class AxonTripParser
 			HeadingDeg     : entry.raw.Heading
 		) { OffsetSeconds = (entry.utc - origin).TotalSeconds }).ToList();
 
-		return new AxonTrip
+		return new Trip
 		{
 			Points        = points,
 			StartUtc      = origin,
 			TotalDuration = duration,
+			SourceFormat  = "JSON",
 		};
 	}
 }
