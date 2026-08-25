@@ -94,13 +94,15 @@
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
       </None>
     </ItemGroup>
-    <ItemGroup>
-      <Folder Include="GPSSimulator\Components\Pages\" />
+    <!-- Exclude native HackRF DLLs from non-Windows builds so Android tooling doesn't scan them -->
+    <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) != 'windows'">
+      <None Remove="hackrf.dll" />
+      <None Remove="hackrf-0.dll" />
+      <None Remove="libusb-1.0.dll" />
+      <None Remove="libwinpthread-1.dll" />
     </ItemGroup>
     <ItemGroup>
-      <None Update="libusb-1.0.dll">
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-      </None>
+      <Folder Include="GPSSimulator\Components\Pages\" />
     </ItemGroup>
 
 </Project>

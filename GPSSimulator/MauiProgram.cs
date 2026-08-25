@@ -17,6 +17,7 @@ namespace GPSSimulator
 
 			builder.Services.AddMauiBlazorWebView();
 			builder.Services.AddSingleton<GpsSimulatorService>();
+			builder.Services.AddSingleton<RinexDownloadService>();
 
 #if DEBUG
 			builder.Services.AddBlazorWebViewDeveloperTools();

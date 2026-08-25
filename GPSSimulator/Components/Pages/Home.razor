@@ -1,6 +1,9 @@
 @page "/"
 @using GPSSimulator.Services
+@using GPSSimulator.GpsEngine
 @inject GpsSimulatorService SimService
+@inject RinexDownloadService RinexDownloader
+@inject IJSRuntime JS
 @implements IDisposable
 
 <h2>GPS SDR Simulator</h2>
@@ -10,12 +13,157 @@
 
     <!-- RINEX file -->
     <div class="col-12">
-        <div class="card">
-            <div class="card-header fw-bold">RINEX Navigation File</div>
+        <div class="card @(rinexCoverage.IsValid && !rinexCoverage.CoversNow && settings.UseCurrentTime ? "border-warning" : "")">
+            <div class="card-header fw-bold d-flex align-items-center justify-content-between">
+                <span>RINEX Navigation File</span>
+                @if (rinexCoverage.IsValid)
+                {
+                    @if (rinexCoverage.CoversNow)
+                    {
+                        <span class="badge bg-success">&#10003; Covers now</span>
+                    }
+                    else
+                    {
+                        <span class="badge bg-warning text-dark">&#9888; Does not cover now</span>
+                    }
+                }
+            </div>
             <div class="card-body">
-                <input class="form-control" @bind="settings.RinexNavFilePath"
-                       placeholder="C:\rinex\brdc0010.22n" disabled="@isRunning" />
+                <div class="d-flex gap-2 align-items-start flex-wrap">
+                    <input class="form-control" @bind="settings.RinexNavFilePath"
+                           @bind:event="oninput"
+                           @onchange="OnRinexPathChanged"
+                           placeholder="C:\Users\matth\Downloads\Rinex_files\brdc2360.26n"
+                           disabled="@isRunning" />
+                    <button class="btn btn-outline-secondary btn-sm text-nowrap"
+                            @onclick="RefreshRinexCoverage"
+                            disabled="@(isRunning || isDownloading || string.IsNullOrWhiteSpace(settings.RinexNavFilePath))"
+                            title="Re-check coverage">
+                        &#8635; Check
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm text-nowrap"
+                            @onclick="DownloadLatestRinex"
+                            disabled="@(isRunning || isDownloading)">
+                        @if (isDownloading)
+                        {
+                            <span class="spinner-border spinner-border-sm me-1" role="status"></span>
+                            <span>Downloading…</span>
+                        }
+                        else
+                        {
+                            <span>&#8659; Download Latest</span>
+                        }
+                    </button>
+                </div>
+                @if (!string.IsNullOrEmpty(downloadStatus))
+                {
+                    <div class="mt-1 small @(downloadError ? "text-danger" : "text-muted") font-monospace">
+                        @downloadStatus
+                    </div>
+                }
                 <div class="form-text">RINEX 2.11 GPS navigation file (e.g. from NASA CDDIS)</div>
+                @if (rinexCoverage.IsValid)
+                {
+                    <div class="mt-1 small text-muted">
+                        Coverage: @rinexCoverage.CoverageStart.ToString("yyyy-MM-dd HH:mm")Z
+                        &ndash; @rinexCoverage.CoverageEnd.ToString("yyyy-MM-dd HH:mm")Z
+                        &nbsp;|&nbsp; Now: @DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm")Z
+                    </div>
+                }
+                else if (rinexCoverage.Error != null)
+                {
+                    <div class="mt-1 small text-danger">@rinexCoverage.Error</div>
+                }
+                <div class="form-check mt-2">
+                    <input class="form-check-input" type="checkbox" id="useNowCheck"
+                           @bind="settings.UseCurrentTime"
+                           disabled="@(isRunning || !rinexCoverage.CoversNow)" />
+                    <label class="form-check-label" for="useNowCheck">
+                        Use current time as simulation start
+                        @if (settings.UseCurrentTime && !rinexCoverage.CoversNow)
+                        {
+                            <span class="text-warning ms-1">(RINEX does not cover now)</span>
+                        }
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- AxonTrip replay -->
+    <div class="col-12">
+        <div class="card @(loadedTrip != null ? "border-primary" : "")">
+            <div class="card-header fw-bold d-flex align-items-center gap-2">
+                AxonTrip Replay
+                @if (loadedTrip != null)
+                {
+                    <span class="badge bg-primary">LOADED</span>
+                }
+            </div>
+            <div class="card-body">
+                <div class="row g-2 align-items-end">
+                    <div class="col-md-8">
+                        <label class="form-label">AxonTrip JSON File Path</label>
+                        <input class="form-control" @bind="axonTripFilePath"
+                               disabled="@isRunning"
+                               placeholder="C:\path\to\TripData-....json" />
+                    </div>
+                    <div class="col-md-2">
+                        <button class="btn btn-outline-primary w-100"
+                                @onclick="LoadAxonTrip"
+                                disabled="@(isRunning || string.IsNullOrWhiteSpace(axonTripFilePath))">
+                            Load Trip
+                        </button>
+                    </div>
+                    <div class="col-md-2">
+                        <button class="btn btn-outline-secondary w-100"
+                                @onclick="ClearAxonTrip"
+                                disabled="@(isRunning || loadedTrip == null)">
+                            Clear
+                        </button>
+                    </div>
+                </div>
+
+                @if (!string.IsNullOrEmpty(tripLoadError))
+                {
+                    <div class="alert alert-danger mt-2 py-1 mb-0">@tripLoadError</div>
+                }
+                @if (loadedTrip != null)
+                {
+                    <div class="alert alert-primary mt-2 py-1 mb-0">@loadedTrip.Summary</div>
+                }
+                @if (isRunning && tripProgress != null)
+                {
+                    <div class="mt-2">
+                        <div class="progress" style="height:8px">
+                            <div class="progress-bar bg-primary" role="progressbar"
+                                 style="width:@(tripProgress.PointCount > 0 ? (100.0 * tripProgress.PointIndex / tripProgress.PointCount).ToString("F1") : "0")%">
+                            </div>
+                        </div>
+                        <small class="text-muted">
+                            Point @tripProgress.PointIndex / @tripProgress.PointCount &nbsp;|&nbsp;
+                            @tripProgress.Latitude.ToString("F6")&deg;, @tripProgress.Longitude.ToString("F6")&deg;
+                            &nbsp;|&nbsp; @tripProgress.SpeedKph.ToString("F1") km/h
+                            &nbsp;|&nbsp; @tripProgress.Elapsed.ToString(@"hh\:mm\:ss") / @tripProgress.Total.ToString(@"hh\:mm\:ss")
+                        </small>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- Map -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header fw-bold d-flex align-items-center justify-content-between">
+                <span>Route Map</span>
+                @if (loadedTrip != null)
+                {
+                    <small class="text-muted">@loadedTrip.Points.Count points</small>
+                }
+            </div>
+            <div class="card-body p-0" style="height:420px">
+                <div id="gps-map" style="height:100%;width:100%;"></div>
             </div>
         </div>
     </div>
@@ -28,18 +176,27 @@
                 <div class="col-12">
                     <label class="form-label">Latitude (deg)</label>
                     <input type="number" class="form-control" step="0.000001" min="-90" max="90"
-                           @bind="settings.Latitude" disabled="@isRunning" />
+                           @bind="settings.Latitude"
+                           disabled="@(isRunning || loadedTrip != null)" />
                 </div>
                 <div class="col-12">
                     <label class="form-label">Longitude (deg)</label>
                     <input type="number" class="form-control" step="0.000001" min="-180" max="180"
-                           @bind="settings.Longitude" disabled="@isRunning" />
+                           @bind="settings.Longitude"
+                           disabled="@(isRunning || loadedTrip != null)" />
                 </div>
                 <div class="col-12">
                     <label class="form-label">Altitude (m)</label>
                     <input type="number" class="form-control" step="1"
-                           @bind="settings.AltitudeMeters" disabled="@isRunning" />
+                           @bind="settings.AltitudeMeters"
+                           disabled="@(isRunning || loadedTrip != null)" />
                 </div>
+                @if (loadedTrip != null)
+                {
+                    <div class="col-12">
+                        <div class="form-text text-primary">Start position taken from trip's first point.</div>
+                    </div>
+                }
             </div>
         </div>
     </div>
@@ -70,11 +227,21 @@
                     <input type="number" class="form-control" step="1" @bind="liveAlt" />
                 </div>
                 <div class="col-12">
-                    <button class="btn btn-outline-success w-100" @onclick="PushLivePosition"
-                            disabled="@(!isRunning)">
+                    <button class="btn btn-outline-success w-100"
+                            @onclick="PushLivePosition"
+                            disabled="@(!isRunning || loadedTrip != null)">
                         Push to SDR
                     </button>
-                    <div class="form-text">Updates the transmitted GPS position immediately — no restart needed</div>
+                    <div class="form-text">
+                        @if (loadedTrip != null)
+                        {
+                            <span>Position is driven automatically by trip replay.</span>
+                        }
+                        else
+                        {
+                            <span>Updates the transmitted GPS position immediately &mdash; no restart needed.</span>
+                        }
+                    </div>
                 </div>
             </div>
         </div>
@@ -100,6 +267,17 @@
                     <input type="number" class="form-control" min="0"
                            @bind="settings.DurationSeconds" disabled="@isRunning" />
                 </div>
+                <div class="col-md-3">
+                    <label class="form-label">Satellites (4-16)</label>
+                    <input type="number" class="form-control" min="4" max="16"
+                           @bind="settings.MaxSatellites" disabled="@isRunning" />
+                    <div class="form-text">Fewer = stronger each</div>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Elevation Mask (deg)</label>
+                    <input type="number" class="form-control" min="0" max="45"
+                           @bind="settings.ElevMaskDeg" disabled="@isRunning" />
+                </div>
                 <div class="col-md-3 d-flex align-items-end">
                     <div class="form-check">
                         <input class="form-check-input" type="checkbox" id="ampCheck"
@@ -115,19 +293,91 @@
     <div class="col-12 d-flex gap-2 align-items-center">
         @if (!isRunning)
         {
-            <button class="btn btn-success" @onclick="StartSimulation">Start</button>
+            @if (loadedTrip != null)
+            {
+                <button class="btn btn-primary" @onclick="StartTripReplay">&#9654; Start Trip Replay</button>
+            }
+            else
+            {
+                <button class="btn btn-success" @onclick="StartSimulation">Start</button>
+            }
         }
         else
         {
             <button class="btn btn-danger" @onclick="StopSimulation">Stop</button>
             <div class="spinner-border spinner-border-sm text-success" role="status"></div>
-            <span class="text-success fw-semibold">Transmitting GPS L1 C/A at 1575.42 MHz</span>
+            @if (loadedTrip != null)
+            {
+                <span class="text-primary fw-semibold">Replaying AxonTrip &#8594; HackRF 1575.42 MHz</span>
+            }
+            else
+            {
+                <span class="text-success fw-semibold">Transmitting GPS L1 C/A at 1575.42 MHz</span>
+            }
         }
         @if (!string.IsNullOrEmpty(errorMessage))
         {
             <span class="text-danger ms-2">@errorMessage</span>
         }
     </div>
+
+    <!-- Live telemetry -->
+    @if (isRunning)
+    {
+        <div class="col-12">
+            <div class="card border-success">
+                <div class="card-body py-2 px-3">
+                    <div class="row g-2 text-center">
+                        <div class="col-6 col-md-3">
+                            <div class="text-muted small">Simulated Time (UTC)</div>
+                            <div class="fw-semibold font-monospace">
+                                @if (tripProgress != null)
+                                {
+                                    @tripProgress.SimulatedUtc.ToString("yyyy-MM-dd HH:mm:ss")
+                                }
+                                else
+                                {
+                                    @DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss")
+                                }
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-2">
+                            <div class="text-muted small">Speed</div>
+                            <div class="fw-semibold">
+                                @if (tripProgress != null)
+                                {
+                                    @($"{tripProgress.SpeedKph:F1} km/h")
+                                }
+                                else
+                                {
+                                    <span class="text-muted">—</span>
+                                }
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-2">
+                            <div class="text-muted small">Latitude</div>
+                            <div class="fw-semibold font-monospace">@liveLat.ToString("F6")°</div>
+                        </div>
+                        <div class="col-6 col-md-2">
+                            <div class="text-muted small">Longitude</div>
+                            <div class="fw-semibold font-monospace">@liveLon.ToString("F6")°</div>
+                        </div>
+                        <div class="col-6 col-md-1">
+                            <div class="text-muted small">Altitude</div>
+                            <div class="fw-semibold">@liveAlt.ToString("F0") m</div>
+                        </div>
+                        @if (tripProgress != null)
+                        {
+                            <div class="col-6 col-md-2">
+                                <div class="text-muted small">Heading</div>
+                                <div class="fw-semibold">@tripProgress.HeadingDeg°</div>
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
 
     <!-- Log -->
     <div class="col-12">
@@ -159,17 +409,33 @@
 @code {
     private SimulatorSettings settings = new()
     {
+        RinexNavFilePath = @"C:\Users\matth\Downloads\Rinex_files\brdc2360.26n",
         Latitude        = 37.7749,
         Longitude       = -122.4194,
-        AltitudeMeters  = 100,
+        AltitudeMeters  = 10,
         DurationSeconds = 0,
-        SampleRateMHz   = 2.6,
-        TxGainDb        = 20
+        SampleRateMHz   = 3.0,
+        TxGainDb        = 18,
+        MaxSatellites   = 8,
+        ElevMaskDeg     = 10.0,
+        AmpEnabled      = false
     };
 
     private double liveLat = 37.7749;
     private double liveLon = -122.4194;
     private double liveAlt = 100;
+
+    // AxonTrip state
+    private string             axonTripFilePath = string.Empty;
+    private AxonTrip?          loadedTrip;
+    private string             tripLoadError    = string.Empty;
+    private TripProgressEvent? tripProgress;
+
+    // RINEX coverage
+    private RinexCoverageResult rinexCoverage = RinexCoverageResult.Unknown;
+    private bool   isDownloading  = false;
+    private string downloadStatus = string.Empty;
+    private bool   downloadError  = false;
 
     private bool   isRunning;
     private string errorMessage = string.Empty;
@@ -177,16 +443,152 @@
 
     protected override void OnInitialized()
     {
-        SimService.LogMessage += OnLog;
+        SimService.LogMessage   += OnLog;
+        SimService.TripProgress += OnTripProgress;
     }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await JS.InvokeVoidAsync("mapInterop.initMap", "gps-map", settings.Latitude, settings.Longitude, 14);
+            // Pre-check coverage for the default RINEX path
+            if (!string.IsNullOrWhiteSpace(settings.RinexNavFilePath))
+                await RefreshRinexCoverage();
+        }
+    }
+
+    // ── RINEX coverage ────────────────────────────────────────────────────────
+
+    private async Task RefreshRinexCoverage()
+    {
+        rinexCoverage = await Task.Run(() => SimService.CheckRinexCoverage(settings.RinexNavFilePath));
+        // If now is no longer covered, uncheck UseCurrentTime
+        if (!rinexCoverage.CoversNow)
+            settings.UseCurrentTime = false;
+        StateHasChanged();
+    }
+
+    private async Task OnRinexPathChanged(ChangeEventArgs e)
+    {
+        settings.RinexNavFilePath = e.Value?.ToString() ?? string.Empty;
+        rinexCoverage = RinexCoverageResult.Unknown;
+        if (!string.IsNullOrWhiteSpace(settings.RinexNavFilePath))
+            await RefreshRinexCoverage();
+    }
+
+    private async Task DownloadLatestRinex()
+    {
+        isDownloading  = true;
+        downloadStatus = "Starting download…";
+        downloadError  = false;
+        StateHasChanged();
+
+        var progress = new Progress<string>(msg =>
+        {
+            downloadStatus = msg;
+            InvokeAsync(StateHasChanged);
+        });
+
+        try
+        {
+            var result = await RinexDownloader.DownloadLatestAsync(progress);
+            downloadError = !result.Success;
+
+            if (result.Success && result.FilePath != null)
+            {
+                settings.RinexNavFilePath = result.FilePath;
+                downloadStatus = $"✓ {result.Message}";
+                await RefreshRinexCoverage();
+            }
+            else
+            {
+                downloadStatus = result.Message;
+            }
+        }
+        catch (Exception ex)
+        {
+            downloadError  = true;
+            downloadStatus = $"Download failed: {ex.Message}";
+        }
+        finally
+        {
+            isDownloading = false;
+            StateHasChanged();
+        }
+    }
+
+    // ── AxonTrip ─────────────────────────────────────────────────────────────
+
+    private async Task LoadAxonTrip()
+    {
+        tripLoadError = string.Empty;
+        loadedTrip    = null;
+        try
+        {
+            loadedTrip = await AxonTripParser.ParseFileAsync(axonTripFilePath);
+            OnLog($"[UI] AxonTrip loaded: {loadedTrip.Summary}");
+            var routePoints = loadedTrip.Points.Select(p => new { lat = p.Latitude, lon = p.Longitude }).ToArray();
+            await JS.InvokeVoidAsync("mapInterop.setRoute", (object)routePoints);
+        }
+        catch (Exception ex)
+        {
+            tripLoadError = ex.Message;
+        }
+        StateHasChanged();
+    }
+
+    private async Task ClearAxonTrip()
+    {
+        loadedTrip    = null;
+        tripProgress  = null;
+        tripLoadError = string.Empty;
+        await JS.InvokeVoidAsync("mapInterop.clearRoute");
+        StateHasChanged();
+    }
+
+    private async Task StartTripReplay()
+    {
+        if (loadedTrip == null) return;
+        errorMessage = string.Empty;
+        tripProgress = null;
+        isRunning    = true;
+        StateHasChanged();
+
+        _ = SimService.StartTripReplayAsync(settings, loadedTrip).ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                errorMessage = t.Exception?.InnerException?.Message ?? "Unknown error";
+            isRunning    = false;
+            tripProgress = null;
+            InvokeAsync(StateHasChanged);
+        });
+
+        await Task.CompletedTask;
+    }
+
+    private void OnTripProgress(TripProgressEvent e)
+    {
+        tripProgress = e;
+        liveLat = e.Latitude;
+        liveLon = e.Longitude;
+        liveAlt = e.AltitudeMeters;
+        InvokeAsync(async () =>
+        {
+            await JS.InvokeVoidAsync("mapInterop.updatePosition", e.Latitude, e.Longitude);
+            StateHasChanged();
+        });
+    }
+
+    // ── Static simulation ────────────────────────────────────────────────────
 
     private async Task StartSimulation()
     {
         errorMessage = string.Empty;
-        liveLat  = settings.Latitude;
-        liveLon  = settings.Longitude;
-        liveAlt  = settings.AltitudeMeters;
-        isRunning = true;
+        liveLat      = settings.Latitude;
+        liveLon      = settings.Longitude;
+        liveAlt      = settings.AltitudeMeters;
+        isRunning    = true;
         StateHasChanged();
 
         _ = SimService.StartAsync(settings).ContinueWith(t =>
@@ -202,10 +604,11 @@
 
     private void StopSimulation() => SimService.Stop();
 
-    private void PushLivePosition()
+    private async Task PushLivePosition()
     {
         SimService.UpdatePosition(liveLat, liveLon, liveAlt);
-        OnLog($"[UI] Position pushed: {liveLat:F6} deg, {liveLon:F6} deg, alt {liveAlt:F0} m");
+        OnLog($"[UI] Position pushed: {liveLat:F6}\u00b0, {liveLon:F6}\u00b0, alt {liveAlt:F0} m");
+        await JS.InvokeVoidAsync("mapInterop.updatePosition", liveLat, liveLon);
     }
 
     private void ClearLog() => logText = string.Empty;
@@ -216,5 +619,9 @@
         InvokeAsync(StateHasChanged);
     }
 
-    public void Dispose() => SimService.LogMessage -= OnLog;
+    public void Dispose()
+    {
+        SimService.LogMessage   -= OnLog;
+        SimService.TripProgress -= OnTripProgress;
+    }
 }

@@ -38,19 +38,51 @@ public sealed class GpsSignalEngine
 	private readonly double _sampFreq;
 	private readonly double _elevMask;
 
+	/// <summary>
+	/// Number of satellites actually transmitted. A receiver only needs 4 for a
+	/// fix; fewer channels means each one gets a larger share of the fixed SC08
+	/// dynamic range (better per-satellite C/N0) and less CPU per epoch.
+	/// </summary>
+	private readonly int _maxActiveChan;
+
 	private const int MaxChan = GpsConstants.MaxChan;
 	private const int MaxSat  = GpsConstants.MaxSat;
+	private const int DebugLogInterval10Hz = 100; // every 10 seconds
+	private const bool UseFixedPowerModel = false; // default to gps-sdr-sim-like path-loss model
+	private const int FixedChannelGain = 112;      // only used when fixed-power mode is enabled
+	private const int Sc08RightShift = 4;          // base SC08 scaling (matches gps.c: iq_buff[i] >> 4)
+	private const int Sc08BoostNumerator = 1;      // no digital boost - parity with reference implementations
+	private const int Sc08BoostDenominator = 1;
+
+	/// <summary>
+	/// Target RMS (standard deviation) of each SC08 component. The sum of N
+	/// independent PRN signals is approximately Gaussian, so peaks reach roughly
+	/// 4 sigma. At sigma = 24 that puts the 4-sigma peak near 96, comfortably
+	/// inside +/-127, giving a fraction of a percent of clipping.
+	/// Raise for more power, lower if clip% exceeds ~1%.
+	/// </summary>
+	private const double Sc08TargetRms = 24.0;
+
+	/// <summary>
+	/// When true, channel gains are renormalised each epoch so the composite
+	/// signal reaches <see cref="Sc08TargetRms"/> regardless of how many channels
+	/// are active. When false the gain chain matches gps-sdr-sim /
+	/// multi-sdr-gps-sim exactly (absolute path-loss gain, plain >>4 on packing).
+	/// </summary>
+	private const bool UseGainNormalization = true;
 
 	public GpsSignalEngine(
 		Ephemeris[][] eph,
 		IonoUtc ionoutc,
 		double sampFreq = DefaultSampleRate,
-		double elevMaskDeg = 0.0)
+		double elevMaskDeg = 0.0,
+		int maxActiveChan = MaxChan)
 	{
 		_eph      = eph;
 		_ionoutc  = ionoutc;
 		_sampFreq = sampFreq;
 		_elevMask = elevMaskDeg * Pi / 180.0;
+		_maxActiveChan = Math.Clamp(maxActiveChan, 4, MaxChan);
 		_chan      = new ChannelState[MaxChan];
 		for (int i = 0; i < MaxChan; i++) _chan[i] = new ChannelState();
 	}
@@ -78,123 +110,136 @@ public sealed class GpsSignalEngine
 			antPat[i] = Math.Pow(10.0, -AntPatDb[i] / 20.0);
 
 		var grx = startTime;
-		int ieph = 0;
-
-		// Find a valid ephemeris set to start with
-		for (int sv = 0; sv < MaxSat; sv++)
-			if (_eph[0][sv].Valid) { break; }
+		int ieph = FindBestEphemerisIndex(grx);
+		int epochCount10Hz = 0;
+		long clipCountAcc = 0;
+		long sampleCountAcc = 0;
+		int  peakAcc = 0;
+		double sumSqAcc = 0.0;
 
 		// Allocate initial channels
 		double[] xyz0 = (double[])CurrentXyz.Clone();
 		AllocateChannels(grx, xyz0, ieph);
+		Log($"Initial ephemeris slot: ieph={ieph}");
 
 		// IQ buffers
 		short[] iq_buff   = new short[iq_buff_size * 2];
 		byte[]  iq8_buff  = new byte [iq_buff_size * 2];
 
+		// Per-epoch channel gains. gps-sdr-sim / multi-sdr-gps-sim compute the
+		// gain once per 0.1 s epoch, NOT per sample. Doing it per sample costs a
+		// float division + clamp for every sample of every channel and makes the
+		// generator slower than real time.
+		int[] chanGain = new int[MaxChan];
+
+		// Measures pure generation cost per epoch (excludes the blocking write to
+		// the SDR). Must stay well below 100 ms/epoch or TX will underrun.
+		var genStopwatch = new System.Diagnostics.Stopwatch();
+
 		Log($"GPS signal engine started. Sample rate: {samp_freq / 1e6:F2} MHz, buffer: {iq_buff_size} samples/epoch");
 
 		while (!ct.IsCancellationRequested)
 		{
+			genStopwatch.Start();
 			double[] xyz = (double[])CurrentXyz.Clone(); // snapshot position
+			UpdateActiveChannelCodePhase(grx, xyz, ieph);
 
-			// ── Generate one 0.1-second epoch of IQ samples ────────────
-			for (int isamp = 0; isamp < iq_buff_size; isamp++)
+			int nActiveGains = 0;
+			for (int i = 0; i < MaxChan; i++)
 			{
-				int i_acc = 0, q_acc = 0;
+				if (_chan[i].Prn == 0) { chanGain[i] = 0; continue; }
+				nActiveGains++;
 
-				for (int i = 0; i < MaxChan; i++)
+				if (UseFixedPowerModel)
 				{
-					if (_chan[i].Prn == 0) continue;
-
-					// Lookup table index from carrier phase accumulator
-					int iTable = (int)((_chan[i].CarrPhase >> 16) & 0x1FFU); // top 9 bits → 0..511
-
-					// Antenna gain
-					double azel_elev = _chan[i].Azel[1];
-					int iang = (int)(90.0 - azel_elev * R2D);
-					iang = Math.Clamp(iang / 5, 0, 36); // 0:5:180 => index 0-36
-					double gain = antPat[iang];
-
-					int igain = (int)(gain * 128.0);
-
-					int ip = _chan[i].DataBit * _chan[i].CodeCA * CosTable512[iTable] * igain;
-					int qp = _chan[i].DataBit * _chan[i].CodeCA * SinTable512[iTable] * igain;
-
-					i_acc += ip;
-					q_acc += qp;
-
-					// Update code phase
-					_chan[i].CodePhase += _chan[i].FCode * delt;
-					if (_chan[i].CodePhase >= CaSeqLen)
-					{
-						_chan[i].CodePhase -= CaSeqLen;
-						_chan[i].Icode++;
-
-						if (_chan[i].Icode >= 20)
-						{
-							_chan[i].Icode = 0;
-							_chan[i].Ibit++;
-
-							if (_chan[i].Ibit >= 30)
-							{
-								_chan[i].Ibit = 0;
-								_chan[i].Iword++;
-							}
-
-							_chan[i].DataBit =
-								(int)((_chan[i].Dwrd[_chan[i].Iword] >> (29 - _chan[i].Ibit)) & 0x1UL) * 2 - 1;
-						}
-					}
-
-					// Current C/A chip
-					_chan[i].CodeCA = _chan[i].Ca[(int)_chan[i].CodePhase] * 2 - 1;
-
-					// Update carrier phase
-					_chan[i].CarrPhase = (uint)(_chan[i].CarrPhase + (uint)_chan[i].CarrPhasestep);
+					chanGain[i] = FixedChannelGain;
 				}
-
-				// Scale by 2^7
-				i_acc = (i_acc + 64) >> 7;
-				q_acc = (q_acc + 64) >> 7;
-
-				iq_buff[isamp * 2]     = (short)i_acc;
-				iq_buff[isamp * 2 + 1] = (short)q_acc;
+				else
+				{
+					int iang = (int)(90.0 - _chan[i].Azel[1] * R2D);
+					iang = Math.Clamp(iang / 5, 0, 36); // 0:5:180 => index 0-36
+					double antGain = antPat[iang];
+					double pathLoss = 20200000.0 / Math.Max(_chan[i].Rho0.D, 1.0); // gps-sdr-sim style
+					chanGain[i] = (int)(pathLoss * antGain * 128.0);
+				}
 			}
 
-			// SC08: shift 12-bit bladeRF values to 8-bit HackRF
-			for (int isamp = 0; isamp < iq_buff_size * 2; isamp++)
-				iq8_buff[isamp] = (byte)(sbyte)(iq_buff[isamp] >> 4);
+			// Optional per-epoch gain normalisation. Disabled by default: it varies
+			// the composite amplitude from epoch to epoch, which disturbs receiver
+			// AGC and carrier tracking. See UseGainNormalization.
+			if (UseGainNormalization)
+			{
+				double sumSq = 0.0;
+				for (int i = 0; i < MaxChan; i++)
+				{
+					double a = chanGain[i] * 250.0 / 128.0 / (1 << Sc08RightShift);
+					sumSq += a * a;
+				}
+				if (sumSq > 0.0)
+				{
+					// Per-component (I or Q) standard deviation: carrier phase splits
+					// each channel's power between I and Q, hence the factor of 2.
+					double sigma = Math.Sqrt(sumSq / 2.0);
+					double scale = Sc08TargetRms / Math.Max(sigma, 1e-9);
+					for (int i = 0; i < MaxChan; i++)
+						chanGain[i] = (int)(chanGain[i] * scale);
+				}
+			}
 
+			// ── Generate one 0.1-second epoch of IQ samples ────────────
+			// Hot loop: compacted to active channels only, with pinned pointers
+			// to eliminate per-sample bounds checks and field indirection.
+			GenerateEpoch(iq_buff, iq_buff_size, chanGain, delt);
+
+			// Convert to SC08 for HackRF.
+			// Keep per-satellite power stable as channel count changes:
+			// no auto-attenuation, only saturate to avoid wraparound.
+			for (int isamp = 0; isamp < iq_buff_size * 2; isamp++)
+			{
+				int raw = Sc08BoostNumerator == 1 && Sc08BoostDenominator == 1
+					? (iq_buff[isamp] >> Sc08RightShift)   // arithmetic shift, matches gps.c
+					: (iq_buff[isamp] * Sc08BoostNumerator) / (Sc08BoostDenominator << Sc08RightShift);
+				int v = Math.Clamp(raw, -127, 127);
+				if (v != raw) clipCountAcc++;
+				int mag = v < 0 ? -v : v;
+				if (mag > peakAcc) peakAcc = mag;
+				sumSqAcc += (double)v * v;
+				sampleCountAcc++;
+				iq8_buff[isamp] = (byte)(sbyte)v;
+			}
+
+			genStopwatch.Stop();
 			await output.WriteAsync(iq8_buff, 0, iq8_buff.Length, ct);
 
-			// ── Every 30 seconds: update nav messages + reallocate ─────
+			epochCount10Hz++;
+
+			if (epochCount10Hz % DebugLogInterval10Hz == 0)
+			{
+				double clipPct = sampleCountAcc > 0 ? (100.0 * clipCountAcc / sampleCountAcc) : 0.0;
+				double msPerEpoch = genStopwatch.Elapsed.TotalMilliseconds / DebugLogInterval10Hz;
+				double rms = sampleCountAcc > 0 ? Math.Sqrt(sumSqAcc / sampleCountAcc) : 0.0;
+				Log($"GEN load: {msPerEpoch:F1} ms per 100 ms epoch ({msPerEpoch / 100.0 * 100.0:F0}% of real time) | SC08 rms={rms:F1} peak={peakAcc}/127");
+				genStopwatch.Reset();
+				LogTrackingDebug(grx, ieph, clipPct);
+				clipCountAcc = 0;
+				sampleCountAcc = 0;
+				peakAcc = 0;
+				sumSqAcc = 0.0;
+			}
+
+			// Every 30 seconds on GPS-time boundaries (match gps-sdr-sim).
 			int igrx = (int)(grx.Sec * 10.0 + 0.5);
 			if (igrx % 300 == 0)
 			{
 				for (int i = 0; i < MaxChan; i++)
+				{
 					if (_chan[i].Prn > 0)
 						GenerateNavMsg(grx, _chan[i], false);
-
-				// Refresh ephemeris if a newer set is available
-				if (ieph + 1 < _eph.Length)
-				{
-					for (int sv = 0; sv < MaxSat; sv++)
-					{
-						if (_eph[ieph + 1][sv].Valid)
-						{
-							double dt = SubGpsTime(_eph[ieph + 1][sv].Toc, grx);
-							if (dt < SecondsInHour)
-							{
-								ieph++;
-								for (int i = 0; i < MaxChan; i++)
-									if (_chan[i].Prn != 0)
-										Eph2Sbf(_eph[ieph][_chan[i].Prn - 1], _ionoutc, _chan[i].Sbf);
-								break;
-							}
-						}
-					}
 				}
+
+				// Keep a single ephemeris slot for the entire run to maximize
+				// receiver stability and avoid rapid in-view fluctuations caused by
+				// runtime epoch switching. Re-enable epoch switching later if needed.
 
 				xyz = (double[])CurrentXyz.Clone();
 				AllocateChannels(grx, xyz, ieph);
@@ -204,6 +249,129 @@ public sealed class GpsSignalEngine
 		}
 
 		Log("GPS signal engine stopped.");
+	}
+
+	// ── Hot sample-generation loop ──────────────────────────────────────────
+
+	/// <summary>
+	/// Flat, cache-friendly copy of the mutable per-channel state used by the
+	/// inner loop. Avoids repeated class-field indirection per sample.
+	/// </summary>
+	private struct ActiveChan
+	{
+		public double CodePhase;
+		public double FCode;
+		public uint CarrPhase;
+		public int CarrPhasestep;
+		public int Gain;
+		public int DataBit;
+		public int CodeCA;
+		public int Iword, Ibit, Icode;
+	}
+
+	private ActiveChan[] _active = new ActiveChan[MaxChan];
+	private readonly int[] _activeIndex = new int[MaxChan];
+
+	/// <summary>
+	/// Generates one 0.1 s epoch of interleaved I/Q into <paramref name="iq_buff"/>.
+	/// Only active channels are visited, state is held in a flat struct array, and
+	/// all per-sample table/array accesses go through pinned pointers so the JIT
+	/// emits no bounds checks in the innermost loop.
+	/// </summary>
+	private unsafe void GenerateEpoch(short[] iq_buff, int iq_buff_size, int[] chanGain, double delt)
+	{
+		// Compact active channels into a dense array.
+		int nActive = 0;
+		for (int i = 0; i < MaxChan; i++)
+		{
+			var ch = _chan[i];
+			if (ch.Prn == 0) continue;
+			_activeIndex[nActive] = i;
+			_active[nActive] = new ActiveChan
+			{
+				CodePhase     = ch.CodePhase,
+				FCode         = ch.FCode,
+				CarrPhase     = ch.CarrPhase,
+				CarrPhasestep = ch.CarrPhasestep,
+				Gain          = chanGain[i],
+				DataBit       = ch.DataBit,
+				CodeCA        = ch.CodeCA,
+				Iword         = ch.Iword,
+				Ibit          = ch.Ibit,
+				Icode         = ch.Icode,
+			};
+			nActive++;
+		}
+
+		fixed (ActiveChan* aBase = _active)
+		fixed (short* iqBase = iq_buff)
+		fixed (int* cosBase = CosTable512)
+		fixed (int* sinBase = SinTable512)
+		{
+			for (int isamp = 0; isamp < iq_buff_size; isamp++)
+			{
+				int i_acc = 0, q_acc = 0;
+
+				for (int a = 0; a < nActive; a++)
+				{
+					ActiveChan* c = aBase + a;
+					var ch = _chan[_activeIndex[a]];
+
+					int iTable = (int)((c->CarrPhase >> 16) & 0x1FFU); // top 9 bits → 0..511
+					int common = c->DataBit * c->CodeCA * c->Gain;
+					i_acc += cosBase[iTable] * common;
+					q_acc += sinBase[iTable] * common;
+
+					// Update code phase
+					c->CodePhase += c->FCode * delt;
+					if (c->CodePhase >= CaSeqLen)
+					{
+						c->CodePhase -= CaSeqLen;
+						c->Icode++;
+
+						if (c->Icode >= 20)
+						{
+							c->Icode = 0;
+							c->Ibit++;
+
+							if (c->Ibit >= 30)
+							{
+								c->Ibit = 0;
+								if (++c->Iword >= ChannelState.NDwrd)
+									c->Iword = 0;   // wrap nav message ring buffer (matches gpssim.c)
+							}
+
+							c->DataBit =
+								(int)((ch.Dwrd[c->Iword] >> (29 - c->Ibit)) & 0x1UL) * 2 - 1;
+						}
+					}
+
+					// Current C/A chip
+					c->CodeCA = ch.Ca[(int)c->CodePhase] * 2 - 1;
+
+					// Update carrier phase
+					c->CarrPhase = (uint)(c->CarrPhase + (uint)c->CarrPhasestep);
+				}
+
+				// Scale by 2^7
+				iqBase[isamp * 2]     = (short)((i_acc + 64) >> 7);
+				iqBase[isamp * 2 + 1] = (short)((q_acc + 64) >> 7);
+			}
+		}
+
+		// Write mutated state back to the canonical channel objects.
+		for (int a = 0; a < nActive; a++)
+		{
+			var ch = _chan[_activeIndex[a]];
+			ref var c = ref _active[a];
+			ch.CodePhase = c.CodePhase;
+			ch.CarrPhase = c.CarrPhase;
+			ch.DataBit   = c.DataBit;
+			ch.CodeCA    = c.CodeCA;
+			ch.Iword     = c.Iword;
+			ch.Ibit      = c.Ibit;
+			ch.Icode     = c.Icode;
+		}
 	}
 
 	// ── Channel allocation ───────────────────────────────────────────
@@ -218,14 +386,8 @@ public sealed class GpsSignalEngine
 		double[][] tmat = MakeTmat();
 		Ltcmat(llh, tmat);
 
-		// Mark which SVs are already tracked
-		bool[] used = new bool[MaxSat];
-		for (int i = 0; i < MaxChan; i++)
-			if (_chan[i].Prn > 0) used[_chan[i].Prn - 1] = true;
-
 		// Compute visibility for all SVs
-		var visibleSvs = new List<(int sv, RangeData rho, double azel_elev)>();
-
+		var visibleSvs = new List<(int sv, RangeData rho, double elev)>();
 		for (int sv = 0; sv < MaxSat; sv++)
 		{
 			if (!_eph[ieph][sv].Valid) continue;
@@ -254,74 +416,181 @@ public sealed class GpsSignalEngine
 			}
 		}
 
-		// Sort by elevation descending
-		visibleSvs.Sort((a, b) => b.azel_elev.CompareTo(a.azel_elev));
+		// Prefer highest-elevation satellites when adding new channels
+		visibleSvs.Sort((a, b) => b.elev.CompareTo(a.elev));
 
-		// Assign visible SVs to channels
+		var visibleBySv = new Dictionary<int, RangeData>(visibleSvs.Count);
+		foreach (var v in visibleSvs)
+			visibleBySv[v.sv] = v.rho;
+
 		bool[] assigned = new bool[MaxSat];
+		int nAssigned = 0;
+
+		// 1) Keep existing channels if their SV is still visible (sticky allocation).
 		for (int i = 0; i < MaxChan; i++)
 		{
-			if (i < visibleSvs.Count)
+			int prn = _chan[i].Prn;
+			if (prn <= 0) continue;
+
+			int sv = prn - 1;
+			if (sv < 0 || sv >= MaxSat || !visibleBySv.TryGetValue(sv, out var rho)
+				|| nAssigned >= _maxActiveChan)
 			{
-				var (sv, rho, _) = visibleSvs[i];
-				int prn = sv + 1;
-
-				if (_chan[i].Prn == prn) continue; // already tracking
-
-				// New SV on this channel
-				_chan[i].Prn = prn;
-				_chan[i].Azel[0] = rho.Azel[0];
-				_chan[i].Azel[1] = rho.Azel[1];
-
-				// Generate C/A code
-				Codegen(_chan[i].Ca, prn);
-
-				// Encode subframes
-				Eph2Sbf(_eph[ieph][sv], _ionoutc, _chan[i].Sbf);
-
-				// Generate navigation message
-				GenerateNavMsg(grx, _chan[i], true);
-
-				// Compute initial code/carrier phase
-				var rho1 = BuildRange(_eph[ieph][sv], IncGpsTime(grx, 0.1), xyz, llh, tmat);
-				ComputeCodePhase(_chan[i], rho, rho1, 0.1);
-
-				assigned[sv] = true;
-			}
-			else
-			{
+				// Satellite no longer visible, or channel budget exhausted: free channel.
 				_chan[i].Prn = 0;
+				continue;
 			}
+
+			// Keep current channel state; only refresh az/el.
+			_chan[i].Azel[0] = rho.Azel[0];
+			_chan[i].Azel[1] = rho.Azel[1];
+			assigned[sv] = true;
+			nAssigned++;
+		}
+
+		// 2) Fill empty channels with best unassigned visible SVs.
+		int next = 0;
+		for (int i = 0; i < MaxChan; i++)
+		{
+			if (_chan[i].Prn > 0) continue;
+			if (nAssigned >= _maxActiveChan) break;
+
+			while (next < visibleSvs.Count && assigned[visibleSvs[next].sv])
+				next++;
+
+			if (next >= visibleSvs.Count)
+				break;
+
+			var (sv, rho, _) = visibleSvs[next++];
+			int newPrn = sv + 1;
+
+			_chan[i].Prn = newPrn;
+			_chan[i].Azel[0] = rho.Azel[0];
+			_chan[i].Azel[1] = rho.Azel[1];
+
+			Codegen(_chan[i].Ca, newPrn);
+			Eph2Sbf(_eph[ieph][sv], _ionoutc, _chan[i].Sbf);
+			GenerateNavMsg(grx, _chan[i], true);
+
+			_chan[i].Rho0 = rho;
+			var rho1 = BuildRange(_eph[ieph][sv], IncGpsTime(grx, 0.1), xyz, llh, tmat);
+			ComputeCodePhase(_chan[i], rho1, 0.1);
+
+			assigned[sv] = true;
+			nAssigned++;
 		}
 	}
 
-	private void ComputeCodePhase(ChannelState chan, RangeData rho0, RangeData rho1, double dt)
+	private void ComputeCodePhase(ChannelState chan, RangeData rho1, double dt)
 	{
-		double rhorate = (rho1.Range - rho0.Range) / dt;
+		double rhorate = (rho1.Range - chan.Rho0.Range) / dt;
 
-		chan.FCcarr  = -rhorate / LambdaL1;
-		chan.FCode   = CodeFreq + chan.FCcarr * CarrToCode;
+		chan.FCcarr = -rhorate / LambdaL1;
+		chan.FCode  = CodeFreq + chan.FCcarr * CarrToCode;
 
-		// Carrier phase step: (f_carr / samp_freq) * 512 table entries, scaled to uint32
-		// We use 32-bit accumulator, 512-entry table. Phase step per sample:
-		//   step = (f_carr / samp_freq) * 512  → multiply by 2^23 for fixed-point
-		double norm_freq = chan.FCcarr / _sampFreq;   // -0.5 .. +0.5
-		chan.CarrPhasestep = (int)(norm_freq * 512.0 * 65536.0); // 16.16 fixed-point into 9-bit table
+		double norm_freq = chan.FCcarr / _sampFreq;
+		chan.CarrPhasestep = (int)(norm_freq * 512.0 * 65536.0);
 
-		double ms = ((SubGpsTime(rho0.G, chan.G0) + 6.0) - rho0.Range / SpeedOfLight) * 1000.0;
+		double ms = ((SubGpsTime(chan.Rho0.G, chan.G0) + 6.0) - chan.Rho0.Range / SpeedOfLight) * 1000.0;
 		int ims = (int)ms;
 		chan.CodePhase = (ms - ims) * CaSeqLen;
 
 		chan.Iword = ims / 600;
+		if (chan.Iword >= ChannelState.NDwrd) chan.Iword %= ChannelState.NDwrd;
 		ims -= chan.Iword * 600;
-		chan.Ibit  = ims / 20;
+		chan.Ibit = ims / 20;
 		ims -= chan.Ibit * 20;
 		chan.Icode = ims;
 
 		chan.CodeCA  = chan.Ca[(int)chan.CodePhase] * 2 - 1;
 		chan.DataBit = (int)((chan.Dwrd[chan.Iword] >> (29 - chan.Ibit)) & 0x1UL) * 2 - 1;
 
-		chan.Rho0 = rho0;
+		// Save current pseudorange as next epoch reference.
+		chan.Rho0 = rho1;
+	}
+
+	private void UpdateActiveChannelCodePhase(GpsTime grx, double[] xyz, int ieph)
+	{
+		double[] llh = new double[3];
+		Xyz2Llh(xyz, llh);
+		double[][] tmat = MakeTmat();
+		Ltcmat(llh, tmat);
+
+		for (int i = 0; i < MaxChan; i++)
+		{
+			int prn = _chan[i].Prn;
+			if (prn <= 0) continue;
+
+			int sv = prn - 1;
+			if (sv < 0 || sv >= MaxSat || !_eph[ieph][sv].Valid) continue;
+
+			var rho = BuildRange(_eph[ieph][sv], grx, xyz, llh, tmat);
+			_chan[i].Azel[0] = rho.Azel[0];
+			_chan[i].Azel[1] = rho.Azel[1];
+			ComputeCodePhase(_chan[i], rho, 0.1);
+		}
+	}
+
+	private int FindBestEphemerisIndex(GpsTime grx)
+	{
+		int bestIdx = 0;
+		double bestAbsDt = double.MaxValue;
+
+		for (int i = 0; i < _eph.Length; i++)
+		{
+			double minAbsDtInSlot = double.MaxValue;
+			bool anyValid = false;
+
+			for (int sv = 0; sv < MaxSat; sv++)
+			{
+				if (!_eph[i][sv].Valid) continue;
+				anyValid = true;
+				double dt = Math.Abs(SubGpsTime(_eph[i][sv].Toc, grx));
+				if (dt < minAbsDtInSlot) minAbsDtInSlot = dt;
+			}
+
+			if (anyValid && minAbsDtInSlot < bestAbsDt)
+			{
+				bestAbsDt = minAbsDtInSlot;
+				bestIdx = i;
+			}
+		}
+
+		return bestIdx;
+	}
+
+	private void LogTrackingDebug(GpsTime grx, int ieph, double clipPct)
+	{
+		var active = new List<ChannelState>(MaxChan);
+		for (int i = 0; i < MaxChan; i++)
+			if (_chan[i].Prn > 0)
+				active.Add(_chan[i]);
+
+		if (active.Count == 0)
+		{
+			Log($"DBG grx={grx.Week}:{grx.Sec:F1} ieph={ieph} active=0");
+			return;
+		}
+
+		var c = active[0];
+		int sfStart = (c.Iword / 10) * 10;
+		int howIdx = Math.Clamp(sfStart + 1, 0, ChannelState.NDwrd - 1);
+		ulong how = c.Dwrd[howIdx];
+		ulong tow = (how >> 13) & 0x1FFFFUL;
+
+		string sky = string.Join(", ",
+			active.Take(Math.Min(4, active.Count)).Select(ch =>
+				$"PRN{ch.Prn:D2}@{ch.Azel[0] * R2D:F0}/{ch.Azel[1] * R2D:F0}"));
+
+		// Quick nav integrity probe for this PRN: expected subframe IDs over 6-word ring
+		// are typically [5,1,2,3,4,5] at indices 1,11,21,31,41,51.
+		int[] idIdx = { 1, 11, 21, 31, 41, 51 };
+		string sfIds = string.Join("/", idIdx.Select(i => ((c.Dwrd[i] >> 8) & 0x7UL).ToString()));
+
+		Log($"DBG grx={grx.Week}:{grx.Sec:F1} ieph={ieph} active={active.Count} " +
+			$"PRN{c.Prn:D2} iword={c.Iword} ibit={c.Ibit} icode={c.Icode} " +
+			$"tow={tow} sf={sfIds} clip={clipPct:F2}% g0={c.G0.Week}:{c.G0.Sec:F1} fCarr={c.FCcarr:F1} fCode={c.FCode:F1} " +
+			$"azel={c.Azel[0] * R2D:F1}/{c.Azel[1] * R2D:F1} | sky={sky}");
 	}
 
 	// ── Range computation ────────────────────────────────────────────

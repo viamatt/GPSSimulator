@@ -271,4 +271,42 @@ public static class GpsMath
 
 	public static double[][] MakeTmat() =>
 		new double[][] { new double[3], new double[3], new double[3] };
+
+	// ── GPS ↔ UTC conversion ─────────────────────────────────────────────────
+
+	/// <summary>
+	/// Current GPS–UTC leap-second offset.
+	/// GPS time is ahead of UTC by this many whole seconds.
+	/// Value of 18 s is correct from 2017-01-01 onwards (IERS Bulletin C).
+	/// Update here if a new leap second is announced.
+	/// </summary>
+	public const int GpsLeapSeconds = 18;
+
+	/// <summary>
+	/// GPS epoch: 1980-01-06 00:00:00 UTC.
+	/// </summary>
+	private static readonly DateTime GpsEpoch = new DateTime(1980, 1, 6, 0, 0, 0, DateTimeKind.Utc);
+
+	/// <summary>
+	/// Convert a UTC <see cref="DateTime"/> to <see cref="GpsTime"/>
+	/// by applying the fixed leap-second offset.
+	/// </summary>
+	public static GpsTime DateTimeUtcToGpsTime(DateTime utc)
+	{
+		// GPS time runs ahead of UTC by <GpsLeapSeconds> seconds (no leap seconds in GPS)
+		var gpsUtcEquivalent = utc.AddSeconds(GpsLeapSeconds);
+		double totalSeconds  = (gpsUtcEquivalent - GpsEpoch).TotalSeconds;
+		int    week          = (int)(totalSeconds / SecondsInWeek);
+		double sec           = totalSeconds - week * SecondsInWeek;
+		return new GpsTime { Week = week, Sec = Math.Round(sec * 1000.0) / 1000.0 };
+	}
+
+	/// <summary>
+	/// Convert a <see cref="GpsTime"/> back to UTC <see cref="DateTime"/>.
+	/// </summary>
+	public static DateTime GpsTimeToDateTimeUtc(GpsTime g)
+	{
+		double totalSeconds = g.Week * SecondsInWeek + g.Sec;
+		return GpsEpoch.AddSeconds(totalSeconds - GpsLeapSeconds);
+	}
 }

@@ -14,7 +14,9 @@ namespace nethackrf
         internal HackRFStream(NetHackrf parent)
         {
             device = parent;
-            max_length = 10240000;
+            // Larger TX ring buffer to absorb producer jitter from managed code.
+            // 2.6 Msps SC08 is ~5.2 MB/s, so 50 MB gives ~9.6 s headroom.
+            max_length = 50 * 1024 * 1024;
             stream_buffer = new byte[max_length];
             buffer_semaphore = new Semaphore(1, 1);
         } // private constructor. Can be called through NetHackrf.StartRX() or NetHackrf.StartTX() methods
@@ -26,17 +28,16 @@ namespace nethackrf
         int write_pos = 0;
         int max_length;
         bool disposed = false;
+        long txUnderrunCount = 0;
+
+        // Keep some data queued before enabling TX to reduce immediate underruns.
+        // Start TX only after a deeper prefill to prevent early callback starvation.
+        const int TxStartThresholdBytes = 4_000_000;
         internal libhackrf.hackrf_delegate callback; // callback delegate which pointer is used by libhackrf to exchange data with device
-        Semaphore event_sem = new Semaphore(0, 1);
+        AutoResetEvent event_sem = new AutoResetEvent(false);
         private void set_event() // set_event and get_event are used to lower CPU usage while Write and Read methods are waiting for new portion of data
         {
-            try
-            {
-                event_sem.Release();
-            } catch (SemaphoreFullException)
-            {
-
-            }
+            event_sem.Set();
         }
         private void get_event() // waiting for event from hackrf.dll. If nothing happens in 5 seconds than the method throws exception
         {
@@ -63,16 +64,33 @@ namespace nethackrf
             } else if(device.mode == NetHackrf.transceiver_mode_t.TX)
             {
                 buffer_semaphore.WaitOne();
-                for (int i = 0; i < transfer->valid_length; i++)
+                int want = transfer->valid_length;
+                int avail = LengthUnsafe();
+                int copy = Math.Min(want, avail);
+
+                // Block-copy out of the ring buffer instead of per-byte marshalling.
+                // The libhackrf callback runs on the USB thread; per-byte work here
+                // is a direct cause of TX underruns.
+                if (copy > 0)
                 {
-                    transfer->buffer[i] = stream_buffer[read_pos];
-                    read_pos++;
-                    if (read_pos >= stream_buffer.Length) read_pos = 0;
-                    if (read_pos == write_pos)
+                    fixed (byte* src = stream_buffer)
                     {
-                        SetOverrunError();
-                        break;
+                        int first = Math.Min(copy, stream_buffer.Length - read_pos);
+                        Buffer.MemoryCopy(src + read_pos, transfer->buffer, first, first);
+                        if (copy > first)
+                            Buffer.MemoryCopy(src, transfer->buffer + first, copy - first, copy - first);
                     }
+                    read_pos += copy;
+                    if (read_pos >= stream_buffer.Length) read_pos -= stream_buffer.Length;
+                }
+
+                if (copy < want)
+                {
+                    // TX buffer drained (underrun): keep transmitter running by
+                    // padding the remainder of this USB transfer with zeros.
+                    new Span<byte>(transfer->buffer + copy, want - copy).Clear();
+                    Interlocked.Increment(ref txUnderrunCount);
+                    SetOverrunError();
                 }
                 buffer_semaphore.Release();
                 set_event();
@@ -83,13 +101,10 @@ namespace nethackrf
         {
             get; private set;
         }
-        private void SetOverrunError() // creates warning of buffer overrun and stops device streaming if necessary
+        private void SetOverrunError() // creates warning of buffer overrun/underrun
         {
             OverrunError = true;
-            if (device.mode == NetHackrf.transceiver_mode_t.TX)
-            {
-                stop_tx_async();
-            }
+            // Do not stop TX on underrun; zero-padding in callback keeps RF stream continuous.
         }
         private async void stop_tx_async() // asynchronous method is used to stop hackrf streaming because hackrf_stop_tx can't be called inside of callback function thread
         {
@@ -112,10 +127,17 @@ namespace nethackrf
 
         public override bool CanSeek { get => false; }
 
+        private int LengthUnsafe()
+        {
+            int ret = write_pos - read_pos;
+            if (ret < 0) ret += stream_buffer.Length;
+            return ret;
+        }
+
+        public long TxUnderrunCount => Interlocked.Read(ref txUnderrunCount);
+
         public override long Length { get {
-                int ret = write_pos - read_pos;
-                if (ret < 0) ret += stream_buffer.Length;
-                return ret;
+                return LengthUnsafe();
             } }
 
         public override long Position { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
@@ -241,8 +263,12 @@ namespace nethackrf
                 }
                 if (device.TxStarted == false)
                 {
-                    libhackrf.hackrf_start_tx(device.device, Marshal.GetFunctionPointerForDelegate<libhackrf.hackrf_delegate>(callback), null);
-                    device.TxStarted = true;
+                    int buffered = LengthUnsafe();
+                    if (buffered >= TxStartThresholdBytes)
+                    {
+                        libhackrf.hackrf_start_tx(device.device, Marshal.GetFunctionPointerForDelegate<libhackrf.hackrf_delegate>(callback), null);
+                        device.TxStarted = true;
+                    }
                 }
             }
             else
@@ -266,6 +292,7 @@ namespace nethackrf
                     if (device.TxStarted) libhackrf.hackrf_stop_tx(device.device);
                 }
                 device.TxStarted = false;
+                event_sem.Dispose();
                 base.Dispose(disposing);
             }
         }

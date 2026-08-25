@@ -45,6 +45,8 @@ public static class GpsNavMessage
 	/// <summary>Encode ephemeris into 5 GPS subframes (10 words each)</summary>
 	public static void Eph2Sbf(Ephemeris eph, IonoUtc ionoutc, ulong[][] sbf)
 	{
+		// Keep WN bits clear here; GenerateNavMsg injects current transmission week
+		// into subframe-1 word 3 each frame (matches gps-sdr-sim behavior).
 		ulong wn       = 0UL;
 		ulong toe      = (ulong)(eph.Toe.Sec / 16.0);
 		ulong toc      = (ulong)(eph.Toc.Sec / 16.0);
@@ -223,7 +225,9 @@ public static class GpsNavMessage
 		var g0 = new GpsTime
 		{
 			Week = g.Week,
-			Sec  = Math.Round(g.Sec * (1.0 / 30.0)) * 30.0  // align to 30-second frame
+			// Match gps-sdr-sim C logic exactly:
+			// ((unsigned long)(g.sec + 0.5))/30 * 30
+			Sec  = Math.Floor((g.Sec + 0.5) / 30.0) * 30.0
 		};
 		chan.G0 = g0;
 

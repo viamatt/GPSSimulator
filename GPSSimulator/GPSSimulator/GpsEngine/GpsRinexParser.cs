@@ -92,6 +92,15 @@ public static class GpsRinexParser
 
 			if (ieph >= EphemArraySize) break;
 
+			// If this SV is already present in the current ephemeris slot,
+			// start a new slot before writing the new record (gpssim-style behavior).
+			if (eph[ieph][sv].Valid && ieph + 1 < EphemArraySize)
+			{
+				ieph++;
+				for (int s2 = 0; s2 < MaxSat; s2++)
+					eph[ieph][s2] = CloneEphemeris(eph[ieph - 1][s2]);
+			}
+
 			var e = eph[ieph][sv];
 			e.Valid = false;
 
@@ -159,7 +168,6 @@ public static class GpsRinexParser
 			// Broadcast Orbit - 6
 			line = lines[lineIdx++];
 			e.Svhlth = (int)ParseRinexD(line, 22, 19);
-			if (e.Svhlth > 0 && e.Svhlth < 32) e.Svhlth += 32;
 			e.Tgd = ParseRinexD(line, 41, 19);
 			e.Iodc = (int)ParseRinexD(line, 60, 19);
 			if (lineIdx >= lines.Length) continue;
@@ -174,20 +182,48 @@ public static class GpsRinexParser
 			e.Sq1e2   = Math.Sqrt(1.0 - e.Ecc * e.Ecc);
 			e.Omgkdot = e.Omgdot - GpsConstants.OmegaEarth;
 
-			// Advance ephemeris slot when same SV appears again
-			bool advance = false;
-			for (int s2 = 0; s2 < MaxSat; s2++)
-				if (s2 != sv && eph[ieph][s2].Valid) { advance = true; break; }
-			if (advance && eph[ieph][sv].Valid && ieph + 1 < EphemArraySize)
-			{
-				// Copy current epoch into next slot and start there
-				ieph++;
-				for (int s2 = 0; s2 < MaxSat; s2++)
-					eph[ieph][s2] = eph[ieph - 1][s2]; // shallow copy (class reference)
-			}
+			// Slot advancement is handled before parsing when duplicate SV is detected.
 		}
 
 		return ieph + 1;
+	}
+
+	private static Ephemeris CloneEphemeris(Ephemeris src)
+	{
+		return new Ephemeris
+		{
+			Valid = src.Valid,
+			T = src.T,
+			Toc = src.Toc,
+			Toe = src.Toe,
+			Iodc = src.Iodc,
+			Iode = src.Iode,
+			Deltan = src.Deltan,
+			Cuc = src.Cuc,
+			Cus = src.Cus,
+			Cic = src.Cic,
+			Cis = src.Cis,
+			Crc = src.Crc,
+			Crs = src.Crs,
+			Ecc = src.Ecc,
+			Sqrta = src.Sqrta,
+			M0 = src.M0,
+			Omg0 = src.Omg0,
+			Inc0 = src.Inc0,
+			Aop = src.Aop,
+			Omgdot = src.Omgdot,
+			Idot = src.Idot,
+			Af0 = src.Af0,
+			Af1 = src.Af1,
+			Af2 = src.Af2,
+			Tgd = src.Tgd,
+			Svhlth = src.Svhlth,
+			CodeL2 = src.CodeL2,
+			N = src.N,
+			Sq1e2 = src.Sq1e2,
+			A = src.A,
+			Omgkdot = src.Omgkdot
+		};
 	}
 
 	// ── RINEX field parser ─────────────────────────────────────────────

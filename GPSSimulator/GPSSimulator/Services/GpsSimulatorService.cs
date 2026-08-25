@@ -4,6 +4,20 @@ using static GPSSimulator.GpsEngine.GpsMath;
 
 namespace GPSSimulator.Services;
 
+/// <summary>Fired each time the trip replay advances to a new point.</summary>
+public record TripProgressEvent(
+    int      PointIndex,
+    int      PointCount,
+    double   Latitude,
+    double   Longitude,
+    double   AltitudeMeters,
+    double   SpeedKph,
+    int      HeadingDeg,
+    TimeSpan Elapsed,
+    TimeSpan Total,
+    DateTime SimulatedUtc   // original timestamp from the trip data
+);
+
 /// <summary>
 /// Orchestrates GPS L1 C/A signal generation (via GpsSignalEngine) and
 /// streaming to HackRF One. Supports live lat/lon updates while transmitting.
@@ -11,10 +25,131 @@ namespace GPSSimulator.Services;
 public class GpsSimulatorService
 {
 	public event Action<string>? LogMessage;
+	public event Action<TripProgressEvent>? TripProgress;
 	public bool IsRunning { get; private set; }
 
 	private CancellationTokenSource? _cts;
 	private GpsSignalEngine? _engine;
+
+	// ── Trip replay ───────────────────────────────────────────────────────────
+
+	/// <summary>
+	/// Start the simulator with an AxonTrip replay.
+	/// Timestamps in the trip are rebased so the trip begins at the RINEX
+	/// simulation start time.  Each position is pushed to the IQ engine at
+	/// the correct wall-clock interval so replay runs at 1× real speed.
+	/// </summary>
+	public async Task StartTripReplayAsync(SimulatorSettings settings, AxonTrip trip)
+	{
+		if (IsRunning) throw new InvalidOperationException("Already running.");
+		ValidateSettings(settings);
+
+		Log($"Trip replay loaded: {trip.Summary}");
+
+		_cts    = new CancellationTokenSource();
+		IsRunning = true;
+		try
+		{
+			// Use first trip point's lat/lon/alt as the simulation start position
+			var first = trip.Points[0];
+			settings = settings with
+			{
+				Latitude       = first.Latitude,
+				Longitude      = first.Longitude,
+				AltitudeMeters = first.AltitudeMeters,
+			};
+
+			// Build engine with trip initial position
+			var g0 = await PrepareEngineAsync(settings, _cts.Token);
+
+					// Run IQ stream and trip position driver in parallel.
+					// Use a linked CTS so either task can abort the other on failure.
+					using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+
+					var simStartUtc = GpsMath.GpsTimeToDateTimeUtc(g0);
+					var driverTask = RunTripDriverAsync(trip, simStartUtc, linkedCts.Token);
+
+			#if WINDOWS
+					var streamTask = TransmitOnWindowsAsync(settings, g0, linkedCts.Token);
+			#else
+					Log("HackRF transmission is only supported on Windows.");
+					var streamTask = Task.CompletedTask;
+			#endif
+					try
+					{
+						await Task.WhenAll(driverTask, streamTask);
+					}
+					catch
+					{
+						// Cancel the other task if one faults, then re-throw the first real error
+						linkedCts.Cancel();
+						await Task.WhenAll(
+							driverTask.ContinueWith(_ => { }, TaskContinuationOptions.None),
+							streamTask.ContinueWith(_ => { }, TaskContinuationOptions.None));
+
+						// Propagate the first non-cancellation exception
+						var ex = (driverTask.Exception ?? streamTask.Exception)?.InnerException;
+						if (ex != null && ex is not OperationCanceledException)
+							throw ex;
+					}
+		}
+		finally { IsRunning = false; _engine = null; }
+	}
+
+	/// <summary>
+	/// Drive position updates from the trip points at 1× real-time speed.
+	/// Rebases trip timestamps so they are relative to wall-clock start.
+	/// </summary>
+	private async Task RunTripDriverAsync(AxonTrip trip, DateTime simStartUtc, CancellationToken ct)
+	{
+		var points    = trip.Points;
+		var wallStart = DateTime.UtcNow;
+		var total     = trip.TotalDuration;
+
+		Log($"Trip driver: {points.Count} points, duration {total:hh\\:mm\\:ss}");
+
+		for (int i = 0; i < points.Count; i++)
+		{
+			if (ct.IsCancellationRequested) break;
+
+			var pt = points[i];
+
+			// How long since we started replaying?
+			var wallElapsed = DateTime.UtcNow - wallStart;
+			// How long should have elapsed by this point in the trip?
+			var targetElapsed = TimeSpan.FromSeconds(pt.OffsetSeconds);
+			// Wait if we're ahead of schedule
+			var delay = targetElapsed - wallElapsed;
+			if (delay > TimeSpan.Zero)
+			{
+				try { await Task.Delay(delay, ct); }
+				catch (OperationCanceledException) { break; }
+			}
+
+			UpdatePosition(pt.Latitude, pt.Longitude, pt.AltitudeMeters);
+
+			TripProgress?.Invoke(new TripProgressEvent(
+				PointIndex    : i,
+				PointCount    : points.Count,
+				Latitude      : pt.Latitude,
+				Longitude     : pt.Longitude,
+				AltitudeMeters: pt.AltitudeMeters,
+				SpeedKph      : pt.SpeedKph,
+				HeadingDeg    : pt.HeadingDeg,
+				Elapsed       : targetElapsed,
+				Total         : total,
+				SimulatedUtc  : simStartUtc + targetElapsed
+			));
+
+			// Log every 60 seconds of trip time
+			if (i % 60 == 0)
+				Log($"[Trip {i + 1}/{points.Count}] {pt.Latitude:F6}, {pt.Longitude:F6} | " +
+					$"{pt.SpeedKph:F0} km/h | {targetElapsed:hh\\:mm\\:ss} elapsed");
+		}
+
+		Log("Trip replay finished.");
+		_cts?.Cancel(); // stop the IQ stream when the trip ends
+	}
 
 	/// <summary>
 	/// Update the simulated receiver position while the engine is running.
@@ -46,6 +181,22 @@ public class GpsSimulatorService
 
 	private async Task RunAsync(SimulatorSettings settings, CancellationToken ct)
 	{
+		var g0 = await PrepareEngineAsync(settings, ct);
+#if WINDOWS
+		await TransmitOnWindowsAsync(settings, g0, ct);
+#else
+		Log("HackRF transmission is only supported on Windows.");
+		await Task.CompletedTask;
+#endif
+	}
+
+	/// <summary>
+	/// Shared engine setup used by both static and trip-replay modes.
+	/// Loads RINEX, creates GpsSignalEngine, sets initial position.
+	/// Returns the simulation start GPS time (g0).
+	/// </summary>
+	private async Task<GpsTime> PrepareEngineAsync(SimulatorSettings settings, CancellationToken ct)
+	{
 		Log("Loading RINEX navigation file...");
 
 		var eph = new Ephemeris[GpsConstants.EphemArraySize][];
@@ -64,26 +215,53 @@ public class GpsSimulatorService
 
 		Log($"Loaded {neph} ephemeris epoch(s). Ionosphere model: {(ionoutc.Vflg ? "Klobuchar" : "default 5 ns")}");
 
-		// Find the start GPS time from the first valid ephemeris
 		GpsTime g0 = GpsTime.Zero;
 		for (int sv = 0; sv < GpsConstants.MaxSat; sv++)
 		{
 			if (eph[0][sv].Valid) { g0 = eph[0][sv].Toc; break; }
 		}
-		Log($"Scenario start: GPS week {g0.Week}, sec {g0.Sec:F0}");
 
-		_engine = new GpsSignalEngine(eph, ionoutc, settings.SampleRateMHz * 1e6, settings.ElevMaskDeg);
+		// If "use current time" is requested, override g0 with DateTime.UtcNow
+		// and verify the RINEX file actually covers this moment.
+		if (settings.UseCurrentTime)
+		{
+			var now    = DateTime.UtcNow;
+			var nowGps = DateTimeUtcToGpsTime(now);
+
+			// Gather the UTC coverage window (all valid Toc ± 2 h)
+			var times = new List<DateTime>();
+			for (int i = 0; i < GpsConstants.EphemArraySize; i++)
+				for (int sv = 0; sv < GpsConstants.MaxSat; sv++)
+					if (eph[i][sv].Valid)
+						times.Add(GpsTimeToDateTimeUtc(eph[i][sv].Toc));
+
+			var coverageStart = times.Min().AddHours(-2);
+			var coverageEnd   = times.Max().AddHours(+2);
+
+			if (now < coverageStart || now > coverageEnd)
+				throw new InvalidOperationException(
+					$"\"Use current time\" is enabled, but the loaded RINEX file does not cover now " +
+					$"({now:yyyy-MM-dd HH:mm}Z). " +
+					$"File covers {coverageStart:yyyy-MM-dd HH:mm}Z – {coverageEnd:yyyy-MM-dd HH:mm}Z. " +
+					$"Download a current RINEX broadcast file (e.g. brdc{now:DDD}.{now:yy}n from NASA CDDIS).");
+
+			g0 = nowGps;
+			Log($"Scenario start overridden to current time: {now:yyyy-MM-dd HH:mm:ss}Z " +
+				$"(GPS week {g0.Week}, sec {g0.Sec:F0})");
+		}
+		else
+		{
+			Log($"Scenario start: GPS week {g0.Week}, sec {g0.Sec:F0} " +
+				$"({GpsTimeToDateTimeUtc(g0):yyyy-MM-dd HH:mm:ss}Z)");
+		}
+
+		_engine = new GpsSignalEngine(eph, ionoutc, settings.SampleRateMHz * 1e6, settings.ElevMaskDeg, settings.MaxSatellites);
 		_engine.LogMessage += Log;
 
-		// Set initial ECEF position
 		UpdatePosition(settings.Latitude, settings.Longitude, settings.AltitudeMeters);
 
-#if WINDOWS
-		await TransmitOnWindowsAsync(settings, g0, ct);
-#else
-		Log("HackRF transmission is only supported on Windows.");
-		await Task.CompletedTask;
-#endif
+		_ = ct; // suppress unused warning; kept for signature parity
+		return g0;
 	}
 
 #if WINDOWS
@@ -128,18 +306,44 @@ public class GpsSimulatorService
 
 			device.CarrierFrequencyMHz = 1575.42;
 			device.SampleFrequencyMHz  = settings.SampleRateMHz;
-			device.FilterBandwidthMHz  = settings.SampleRateMHz;
+			// Baseband filter must be wider than the sample rate, otherwise the
+			// C/A main lobe (+/-1.023 MHz) is clipped and C/N0 collapses.
+			// multi-sdr-gps-sim uses 2x the sample rate.
+			device.FilterBandwidthMHz  = settings.SampleRateMHz * 2.0;
 			device.TXVGAGainDb         = settings.TxGainDb;
 			device.AMPEnable           = settings.AmpEnabled;
+			device.AntPower            = false; // bias tee off
 
-			Log($"HackRF configured: 1575.42 MHz | {settings.SampleRateMHz} MHz SR | {settings.TxGainDb} dB VGA");
+			Log($"HackRF configured: 1575.42 MHz | {settings.SampleRateMHz} MHz SR | {settings.SampleRateMHz * 2.0:F1} MHz BW | {settings.TxGainDb} dB VGA");
 
-			txStream = device.StartTX();
+			var hackrfTx = device.StartTX();
+			txStream = hackrfTx;
 			Log("Streaming live GPS IQ → HackRF (update lat/lon anytime)...");
 
 			using var limitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 			if (settings.DurationSeconds > 0)
 				limitCts.CancelAfter(TimeSpan.FromSeconds(settings.DurationSeconds));
+
+			// Periodically report TX underruns so streaming continuity is visible
+			// in the log without attaching a debugger.
+			var underrunMonitor = Task.Run(async () =>
+			{
+				long last = 0;
+				try
+				{
+					while (!limitCts.Token.IsCancellationRequested)
+					{
+						await Task.Delay(10000, limitCts.Token);
+						long now = hackrfTx.TxUnderrunCount;
+						if (now != last)
+						{
+							Log($"TX underruns: {now} (+{now - last} in last 10 s)");
+							last = now;
+						}
+					}
+				}
+				catch (OperationCanceledException) { }
+			}, limitCts.Token);
 
 			await _engine!.StreamAsync(txStream, g0, limitCts.Token);
 		}
@@ -152,6 +356,57 @@ public class GpsSimulatorService
 		}
 	}
 #endif
+
+	/// <summary>
+	/// Reads the RINEX file header and ephemeris epochs to determine the UTC time
+	/// window the file covers. Returns a <see cref="RinexCoverageResult"/> that
+	/// the UI can use to warn the user when "Use current time" is selected.
+	/// </summary>
+	public RinexCoverageResult CheckRinexCoverage(string rinexPath)
+	{
+		if (!File.Exists(rinexPath))
+			return RinexCoverageResult.FileNotFound;
+
+		try
+		{
+			var eph = new Ephemeris[GpsConstants.EphemArraySize][];
+			for (int i = 0; i < GpsConstants.EphemArraySize; i++)
+			{
+				eph[i] = new Ephemeris[GpsConstants.MaxSat];
+				for (int sv = 0; sv < GpsConstants.MaxSat; sv++)
+					eph[i][sv] = new Ephemeris();
+			}
+			var ionoutc = new IonoUtc();
+			int neph = GpsRinexParser.ReadRinexNavAll(eph, ionoutc, rinexPath);
+			if (neph <= 0) return RinexCoverageResult.ParseError;
+
+			// Collect all valid Toc values and convert to UTC
+			var times = new List<DateTime>();
+			for (int i = 0; i < GpsConstants.EphemArraySize; i++)
+				for (int sv = 0; sv < GpsConstants.MaxSat; sv++)
+					if (eph[i][sv].Valid)
+						times.Add(GpsTimeToDateTimeUtc(eph[i][sv].Toc));
+
+			if (times.Count == 0) return RinexCoverageResult.ParseError;
+
+			// Each ephemeris is valid ±2 h around its Toc
+			var coverageStart = times.Min().AddHours(-2);
+			var coverageEnd   = times.Max().AddHours(+2);
+			var now           = DateTime.UtcNow;
+			bool coversNow    = now >= coverageStart && now <= coverageEnd;
+
+			return new RinexCoverageResult(
+				IsValid      : true,
+				CoverageStart: coverageStart,
+				CoverageEnd  : coverageEnd,
+				CoversNow    : coversNow,
+				Error        : null);
+		}
+		catch (Exception ex)
+		{
+			return new RinexCoverageResult(false, DateTime.MinValue, DateTime.MinValue, false, ex.Message);
+		}
+	}
 
 	private void ValidateSettings(SimulatorSettings s)
 	{
@@ -167,15 +422,45 @@ public class GpsSimulatorService
 		LogMessage?.Invoke($"[{DateTime.Now:HH:mm:ss}] {message}");
 }
 
-public class SimulatorSettings
+public record SimulatorSettings
 {
 	public string RinexNavFilePath { get; set; } = string.Empty;
 	public double Latitude         { get; set; }
 	public double Longitude        { get; set; }
 	public double AltitudeMeters   { get; set; } = 100.0;
 	public int    DurationSeconds  { get; set; } = 0;       // 0 = run until stopped
-	public double SampleRateMHz    { get; set; } = 2.6;
-	public int    TxGainDb         { get; set; } = 20;
-	public bool   AmpEnabled       { get; set; } = false;
-	public double ElevMaskDeg      { get; set; } = 0.0;
+	public double SampleRateMHz    { get; set; } = 3.0;
+	public int    TxGainDb         { get; set; } = 30;
+	public bool   AmpEnabled       { get; set; } = true;
+	public double ElevMaskDeg      { get; set; } = 10.0;
+	/// <summary>
+	/// Number of satellites transmitted. A fix needs 4; using fewer channels
+	/// gives each satellite a larger share of the SC08 dynamic range, which
+	/// raises per-satellite C/N0 and makes acquisition far more reliable.
+	/// </summary>
+	public int    MaxSatellites    { get; set; } = 8;
+	/// <summary>
+	/// When true, the simulation's GPS start time is set to DateTime.UtcNow
+	/// instead of the first epoch in the RINEX file.
+	/// The RINEX file must cover the current time for this to succeed.
+	/// </summary>
+	public bool   UseCurrentTime   { get; set; } = false;
+}
+
+/// <summary>
+/// Result of proactively checking whether a RINEX file covers a given time.
+/// </summary>
+public record RinexCoverageResult(
+	bool     IsValid,
+	DateTime CoverageStart,
+	DateTime CoverageEnd,
+	bool     CoversNow,
+	string?  Error)
+{
+	public static readonly RinexCoverageResult FileNotFound =
+		new(false, DateTime.MinValue, DateTime.MinValue, false, "File not found.");
+	public static readonly RinexCoverageResult ParseError =
+		new(false, DateTime.MinValue, DateTime.MinValue, false, "Could not parse RINEX file.");
+	public static readonly RinexCoverageResult Unknown =
+		new(false, DateTime.MinValue, DateTime.MinValue, false, null);
 }
